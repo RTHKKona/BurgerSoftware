@@ -652,7 +652,6 @@ class HexEditorView(ttk.Frame):
             self.popin_btn.pack(side=tk.RIGHT, padx=5, pady=2)
         else:
             self.popout_btn.pack(side=tk.RIGHT, padx=5, pady=2)
-            # Apply button hidden in embedded view, changes are auto-staged
     def on_modified(self, widget):
         if widget.edit_modified():
              self.apply_btn.config(state=tk.NORMAL if self.is_popup else tk.DISABLED)
@@ -672,6 +671,9 @@ class HexEditorView(ttk.Frame):
         for widget in [self.addr_text, self.hex_text, self.ascii_text]:
             widget.config(state=tk.NORMAL); widget.delete('1.0', tk.END); widget.config(state=tk.DISABLED)
         self.hex_text.edit_reset(); self.ascii_text.edit_reset(); self.apply_btn.config(state=tk.DISABLED)
+        # Also update popout button state in main app when clearing
+        if not self.is_popup: self.app.update_button_states()
+
     def load_data(self, entry, data: bytes):
         self.clear();
         if data is None: data = b''
@@ -702,7 +704,7 @@ class HexEditorView(ttk.Frame):
         self._scroll_views('moveto', '0.0'); self.hex_text.config(state=tk.NORMAL); self.ascii_text.config(state=tk.NORMAL); self.addr_text.config(state=tk.DISABLED)
         self.hex_text.edit_reset(); self.ascii_text.edit_reset(); self.hex_text.edit_modified(False); self.ascii_text.edit_modified(False)
         self.apply_btn.config(state=tk.DISABLED)
-        self.app.update_button_states() # Update main popout button state
+        if not self.is_popup: self.app.update_button_states() # Update main popout button state
 
     def schedule_update(self, event, source):
         if self._edit_debounce: self.after_cancel(self._edit_debounce)
@@ -711,10 +713,9 @@ class HexEditorView(ttk.Frame):
     def handle_edit(self, source):
         if not self.current_entry: return; self._edit_debounce = None
         widget = self.hex_text if source == 'hex' else self.ascii_text
-        # Check modified flag AFTER processing the event that set it (using schedule_update helps)
-        # if not widget.edit_modified(): return # This flag might be reset too early, check content diff instead?
-
-        # Get content and compare to previous state or re-parse fully
+        # Check if content actually changed from internal buffer
+        # This is more reliable than the edit_modified flag after programmatic changes
+        content_changed = False
         try:
             content = widget.get('1.0', tk.END + "-1c")
             lines = content.split('\n')
@@ -733,53 +734,50 @@ class HexEditorView(ttk.Frame):
                     if len(byte_hex) == 2:
                         try: new_byte_val = int(byte_hex, 16)
                         except ValueError: self.app.log_message(f"Invalid hex '{byte_hex}' line {line_idx+1}", "WARN"); new_byte_val = self._raw_data[current_offset] if current_offset < original_data_len else 0; parsing_ok = False
-                    elif len(byte_hex) == 1 and j == len(hex_bytes_str) - 1: # Allow single char at end? No, require pairs.
-                         self.app.log_message(f"Incomplete hex byte '{byte_hex}' line {line_idx+1}", "WARN"); new_byte_val = self._raw_data[current_offset] if current_offset < original_data_len else 0; parsing_ok = False
-                    else: # Should not happen if split correctly
-                        continue # Skip unexpected spacing issues
-
-                    new_byte_list.append(new_byte_val)
-                    byte_index_in_line += 1
-                    if len(new_byte_list) > original_data_len: break # Prevent exceeding original length for now (no insert)
+                    elif len(byte_hex) == 1 and j == len(hex_bytes_str) - 1: self.app.log_message(f"Incomplete hex byte '{byte_hex}' line {line_idx+1}", "WARN"); new_byte_val = self._raw_data[current_offset] if current_offset < original_data_len else 0; parsing_ok = False
+                    else: continue
+                    new_byte_list.append(new_byte_val); byte_index_in_line += 1
+                    if len(new_byte_list) > original_data_len: break # No insert
                 line_offset += self.BYTES_PER_ROW
-                if len(new_byte_list) >= original_data_len: break # Stop processing lines if we reached original size
-            # Pad if user deleted hex chars making it shorter than original
-            new_byte_list.extend(self._raw_data[len(new_byte_list):])
+                if len(new_byte_list) >= original_data_len: break
+            new_byte_list.extend(self._raw_data[len(new_byte_list):]) # Pad if needed
 
         elif source == 'ascii':
             line_offset = 0
             for line_idx, line in enumerate(lines):
+                line = line.ljust(self.BYTES_PER_ROW, '\0')[:self.BYTES_PER_ROW]
                 for j in range(self.BYTES_PER_ROW):
                     current_offset = line_offset + j
-                    if current_offset >= original_data_len: break # Stop at original length
-                    if j < len(line):
-                         char = line[j]
-                         try: new_byte_val = char.encode('cp1252')[0]
-                         except UnicodeEncodeError: new_byte_val = ord('.')
-                    else: # Shorter line than expected? Use original byte
-                        new_byte_val = self._raw_data[current_offset]
+                    if current_offset >= original_data_len: break
+                    char = line[j];
+                    try: new_byte_val = char.encode('cp1252')[0]
+                    except: new_byte_val = ord('.')
                     new_byte_list.append(new_byte_val)
                 line_offset += self.BYTES_PER_ROW
                 if current_offset >= original_data_len -1: break
+            # Pad if needed
+            new_byte_list.extend(self._raw_data[len(new_byte_list):])
 
-
-        # Compare and update if changed
+        # --- Final comparison and update ---
         if bytes(new_byte_list) != self._raw_data:
-             self.app.log_message(f"Hex data modified ({len(new_byte_list)} bytes). Staging changes.", "DEBUG")
-             self._raw_data = new_byte_list # Update internal buffer
+             self.app.log_message(f"Hex data modified ({len(new_byte_list)} bytes). Staging.", "DEBUG")
+             self._raw_data = new_byte_list
              self.app.mark_dirty(True)
              self.current_entry.data_to_write = bytes(self._raw_data)
              self.current_entry.is_dirty = True
-             self.update_view_from_data('ascii' if source == 'hex' else 'hex') # Refresh other view
+             self.update_view_from_data('ascii' if source == 'hex' else 'hex') # Refresh other
              self.apply_btn.config(state=tk.NORMAL if self.is_popup else tk.DISABLED)
+        else:
+             self.app.log_message("Hex content unchanged after parsing.", "DEBUG")
 
-        widget.edit_modified(False) # Reset modified flag
+
+        # Reset modified flag AFTER processing to avoid loops with update_view_from_data
+        widget.edit_modified(False)
 
     def update_view_from_data(self, view_to_update):
         if not self.current_entry: return
         self.app.log_message(f"Refreshing {view_to_update} view...", "DEBUG")
         hex_scroll = self.hex_text.yview(); ascii_scroll = self.ascii_text.yview()
-        # Temporarily unbind to prevent recursive updates
         self.hex_text.unbind("<KeyRelease>"); self.ascii_text.unbind("<KeyRelease>")
         self.hex_text.unbind("<<Modified>>"); self.ascii_text.unbind("<<Modified>>")
 
@@ -811,15 +809,15 @@ class HexEditorView(ttk.Frame):
             current_line += 1
         widget.config(state=tk.NORMAL)
         self.hex_text.yview_moveto(hex_scroll[0]); self.ascii_text.yview_moveto(ascii_scroll[0]); self.addr_text.yview_moveto(hex_scroll[0])
-        # Rebind events
         self.hex_text.bind("<KeyRelease>", lambda e: self.schedule_update(e, 'hex')); self.ascii_text.bind("<KeyRelease>", lambda e: self.schedule_update(e, 'ascii'))
         self.hex_text.bind("<<Modified>>", lambda e: self.on_modified(self.hex_text)); self.ascii_text.bind("<<Modified>>", lambda e: self.on_modified(self.ascii_text))
-        widget.edit_modified(False) # Crucial: Reset flag after programmatic change
+        widget.edit_modified(False) # Reset flag
 
     def apply_changes(self):
-        if self.current_entry and (self.hex_text.edit_modified() or self.ascii_text.edit_modified()):
-            # Rerun handle_edit to ensure data is fully synced before applying
-            self.handle_edit(self._last_edit_source or 'hex') # Use last source or default to hex
+        # Rerun handle_edit to ensure internal state is synced with latest widget content
+        if self.hex_text.edit_modified(): self.handle_edit('hex')
+        if self.ascii_text.edit_modified(): self.handle_edit('ascii')
+
         if self.current_entry and self.current_entry.is_dirty:
              self.app.log_message(f"Applied hex editor changes to: {self.current_entry.get_full_name()}")
              self.app.mark_dirty(True); self.apply_btn.config(state=tk.DISABLED)
@@ -829,8 +827,10 @@ class HexEditorView(ttk.Frame):
 # --- Main GUI Application ---
 class MtArcToolApp:
     def __init__(self, root):
+        # ... (Initialization - unchanged) ...
         self.root = root; self.root.title("MT ARC Tool"); self.root.geometry("1100x750"); self.root.configure(bg=BG_COLOR)
         self.arc = MtArc(); self.is_dirty = False; self.tree_item_map = {}; self.tree_sort_column = "#0"; self.tree_sort_reverse = False; self.hex_editor_popup = None
+        self.tree_iid_to_entry = {}
         self.setup_styles()
         self.menu_bar = tk.Menu(root, bg=BG_COLOR, fg=TEXT_COLOR, activebackground=HIGHLIGHT_BG, activeforeground=HIGHLIGHT_FG, relief=tk.FLAT, bd=0)
         self.file_menu = tk.Menu(self.menu_bar, tearoff=0, bg=BUTTON_BG, fg=TEXT_COLOR, activebackground=HIGHLIGHT_BG, activeforeground=HIGHLIGHT_FG)
@@ -848,11 +848,11 @@ class MtArcToolApp:
         self.tree.heading("#0", text="File Path", anchor=tk.W, command=lambda: self.sort_tree_column("#0", False)); self.tree.heading("Size", text="Size", anchor=tk.E, command=lambda: self.sort_tree_column("Size", False)); self.tree.heading("CompSize", text="Comp Size", anchor=tk.E, command=lambda: self.sort_tree_column("CompSize", False)); self.tree.heading("Offset", text="Offset", anchor=tk.E, command=lambda: self.sort_tree_column("Offset", False))
         self.tree.column("#0", width=300, stretch=tk.YES, anchor=tk.W); self.tree.column("Size", width=80, stretch=tk.NO, anchor=tk.E); self.tree.column("CompSize", width=80, stretch=tk.NO, anchor=tk.E); self.tree.column("Offset", width=80, stretch=tk.NO, anchor=tk.E)
         self.tree_scroll_y.config(command=self.tree.yview); self.tree_scroll_x.config(command=self.tree.xview); self.tree.grid(row=0, column=0, sticky="nsew"); self.tree_scroll_y.grid(row=0, column=1, sticky="ns"); self.tree_scroll_x.grid(row=1, column=0, sticky="ew")
-        self.tree.bind('<<TreeviewSelect>>', self.on_tree_select); self.tree.bind('<Double-1>', self.on_tree_select)
+        self.tree.bind('<<TreeviewSelect>>', self.on_tree_select); self.tree.bind('<Double-1>', self.on_tree_select) # Double click handled
         self.right_v_pane = tk.PanedWindow(self.main_h_pane, orient=tk.VERTICAL, sashrelief=tk.RAISED, sashwidth=5, bg=BG_COLOR); self.main_h_pane.add(self.right_v_pane, stretch="always", minsize=550)
         self.hex_editor_frame_outer = ttk.LabelFrame(self.right_v_pane, text="Hex Editor", style="Dark.TLabelframe", padding=5); self.right_v_pane.add(self.hex_editor_frame_outer, stretch="always", minsize=300)
         self.hex_editor_frame_outer.grid_rowconfigure(1, weight=1); self.hex_editor_frame_outer.grid_columnconfigure(0, weight=1)
-        self.hex_editor_view = HexEditorView(self.hex_editor_frame_outer, self, is_popup=False); self.hex_editor_view.grid(row=1, column=0, sticky="nsew") # Place embedded view
+        self.hex_editor_view = HexEditorView(self.hex_editor_frame_outer, self, is_popup=False); self.hex_editor_view.grid(row=1, column=0, sticky="nsew")
         self.log_frame = ttk.LabelFrame(self.right_v_pane, text="Console Log", style="Dark.TLabelframe", padding="5"); self.right_v_pane.add(self.log_frame, stretch="never", minsize=150)
         self.log_frame.grid_rowconfigure(0, weight=1); self.log_frame.grid_columnconfigure(0, weight=1)
         self.log_text = tk.Text(self.log_frame, height=10, width=80, wrap=tk.WORD, state=tk.DISABLED, font=("Consolas", 9) if os.name == 'nt' else ("Monospace", 10), bg=WIDGET_BG, fg=TEXT_COLOR, relief=tk.FLAT, bd=0, selectbackground=HIGHLIGHT_BG, selectforeground=HIGHLIGHT_FG, insertbackground=TEXT_COLOR)
@@ -906,7 +906,7 @@ class MtArcToolApp:
         elif self.arc.entries: title += " - [New ARC]"
         if self.is_dirty: title += "*"; self.root.title(title); self.update_button_states()
     def update_button_states(self):
-        # ... (update_button_states - check for hex_editor_view) ...
+        # ... (update_button_states - logic updated) ...
         has_entries = bool(self.arc.entries); has_selection = bool(self.tree.selection())
         single_file_selected = False; can_popout = False
         if has_selection:
@@ -916,17 +916,16 @@ class MtArcToolApp:
              if tags and 'file' in tags: single_file_selected = (len(self.tree.selection()) == 1); can_popout = True
         can_save = has_entries or self.is_dirty
         self.file_menu.entryconfig("Save ARC As...", state=tk.NORMAL if can_save else tk.DISABLED)
-        self.extract_selected_btn.config(state=tk.NORMAL if single_file_selected else tk.DISABLED)
+        self.extract_selected_btn.config(state=tk.NORMAL if single_file_selected else tk.DISABLED) # Only allow extracting single file for now
         self.extract_all_btn.config(state=tk.NORMAL if has_entries else tk.DISABLED)
         self.add_files_btn.config(state=tk.NORMAL if (self.arc.source_filepath or has_entries) else tk.DISABLED)
-        self.remove_selected_btn.config(state=tk.NORMAL if single_file_selected else tk.DISABLED)
+        self.remove_selected_btn.config(state=tk.NORMAL if single_file_selected else tk.DISABLED) # Only remove single file for now
         self.replace_selected_btn.config(state=tk.NORMAL if single_file_selected else tk.DISABLED)
-        if hasattr(self, 'hex_editor_view') and hasattr(self.hex_editor_view, 'popout_btn'):
-            self.hex_editor_view.popout_btn.config(state=tk.NORMAL if can_popout and not self.hex_editor_popup else tk.DISABLED)
+        if hasattr(self, 'hex_editor_view') and hasattr(self.hex_editor_view, 'popout_btn'): self.hex_editor_view.popout_btn.config(state=tk.NORMAL if can_popout and not self.hex_editor_popup else tk.DISABLED)
 
     def populate_tree(self):
-        # ... (populate_tree - unchanged) ...
-        for item in self.tree.get_children(): self.tree.delete(item); self.tree_item_map = {}
+        # ... (populate_tree - logic updated) ...
+        for item in self.tree.get_children(): self.tree.delete(item); self.tree_item_map = {}; self.tree_iid_to_entry = {}
         if not self.arc.entries: self.update_button_states(); return
         sorted_entries = sorted(self.arc.entries, key=lambda e: e.get_full_name())
         for entry in sorted_entries:
@@ -938,19 +937,20 @@ class MtArcToolApp:
                 else: parent_iid = self.tree_item_map[current_path]
             size=entry.get_decompressed_size(self.arc.platform); comp_size_val=entry.comp_size if entry.comp_size!=-1 else -1; offset_val=entry.offset if entry.offset!=-1 else -1
             comp_size_disp=f"{comp_size_val:,}" if comp_size_val!=-1 else "N/A"; offset_disp=f"{offset_val:#0X}" if offset_val!=-1 else "N/A"
-            file_iid = id(entry)
-            self.tree.insert(parent_iid, tk.END, iid=file_iid, text=filename, values=(f"{size:,}", comp_size_disp, offset_disp), tags=('file', entry))
+            file_iid = id(entry); self.tree_iid_to_entry[file_iid] = entry # Store mapping
+            self.tree.insert(parent_iid, tk.END, iid=file_iid, text=filename, values=(f"{size:,}", comp_size_disp, offset_disp), tags=('file',)) # Use file tag only
         self.update_button_states()
     def get_selected_entries(self) -> list[IMtEntryPy]:
-        # ... (get_selected_entries - unchanged) ...
+        # ... (get_selected_entries - updated to use mapping) ...
         selected_iids = self.tree.selection(); entries = []
-        for iid in selected_iids:
-            try: tags = self.tree.item(iid, "tags");
-            except tk.TclError: continue
-            if tags and 'file' in tags and len(tags) > 1 and isinstance(tags[1], IMtEntryPy): entries.append(tags[1])
+        for iid_str in selected_iids:
+            try: iid_int = int(iid_str);
+            except ValueError: continue # Skip if iid isn't an int (shouldn't happen with id())
+            if iid_int in self.tree_iid_to_entry: entries.append(self.tree_iid_to_entry[iid_int])
+            # else: It's likely a folder, ignore
         return entries
     def sort_tree_column(self, col, reverse):
-        # ... (sort_tree_column - unchanged) ...
+        # ... (sort_tree_column - logic unchanged) ...
         selected_items = self.tree.selection(); parents_to_sort = set()
         if selected_items:
              for iid in selected_items: parents_to_sort.add(self.tree.parent(iid))
@@ -962,7 +962,8 @@ class MtArcToolApp:
             if not children: continue
             items_data = []
             for child_iid in children:
-                tags=self.tree.item(child_iid,"tags"); is_folder='folder' in tags; entry_obj=tags[1] if len(tags)>1 and isinstance(tags[1], IMtEntryPy) else None
+                tags=self.tree.item(child_iid,"tags"); is_folder='folder' in tags;
+                entry_obj = self.tree_iid_to_entry.get(int(child_iid)) if not is_folder else None # Use mapping
                 item_text=self.tree.item(child_iid,"text"); name_val=item_text; size_val=-1; compsize_val=-1; offset_val=-1
                 if entry_obj:
                     try: size_val_str=self.tree.set(child_iid,"Size").replace(',',''); size_val=int(size_val_str) if size_val_str.isdigit() else -1
@@ -977,37 +978,37 @@ class MtArcToolApp:
                 elif sort_key=="offset": sort_val=offset_val
                 items_data.append({'iid':child_iid, 'sort_key':sort_val, 'is_folder':is_folder})
             try: items_data.sort(key=lambda x:(not x['is_folder'], x['sort_key']), reverse=reverse)
-            except TypeError: self.log_message(f"Sort fail '{col}' under '{parent_iid or 'root'}'. Sort by name.", "WARN"); items_data.sort(key=lambda x:(not x['is_folder'], self.tree.item(x['iid'],"text")), reverse=reverse)
+            except TypeError: self.log_message(f"Cannot sort col '{col}' mixed types under '{parent_iid or 'root'}'. Sort by name.", "WARN"); items_data.sort(key=lambda x:(not x['is_folder'], self.tree.item(x['iid'],"text")), reverse=reverse)
             for i, item_info in enumerate(items_data): self.tree.move(item_info['iid'], parent_iid, i)
         self.tree.heading(col, command=lambda: self.sort_tree_column(col, not reverse))
 
-    def on_tree_select(self, event=None): # Updated with logging
+    def on_tree_select(self, event=None): # Updated with fix
         self.log_message(f"on_tree_select triggered (Event: {event})", "DEBUG")
         selected_iids = self.tree.selection()
         self.log_message(f"  Selected IDs tuple: {selected_iids}", "DEBUG")
-        if not selected_iids:
-            self.log_message(f"  No selection, clearing hex editor.", "DEBUG")
-            self.hex_editor_view.clear(); self.update_button_states(); return
-        iid = selected_iids[0]
-        self.log_message(f"  Processing first selected iid: {iid}", "DEBUG")
-        try: tags = self.tree.item(iid, "tags"); item_text = self.tree.item(iid, "text"); self.log_message(f"  Item ID: {iid}, Text: '{item_text}', Tags: {tags}", "DEBUG")
-        except tk.TclError: self.log_message(f"  Item {iid} no longer exists.", "WARN"); self.hex_editor_view.clear(); self.update_button_states(); return
-        if tags and 'file' in tags and len(tags) > 1 and isinstance(tags[1], IMtEntryPy):
-            entry = tags[1]; self.log_message(f"  Selected entry is file: {entry.get_full_name()}", "DEBUG")
-            self.log_message(f"Loading '{entry.get_full_name()}' into Hex Editor...")
-            self.set_status(f"Loading {entry.get_full_name()}...")
+        if not selected_iids: self.log_message(f"  No selection.", "DEBUG"); self.hex_editor_view.clear(); self.update_button_states(); return
+        iid_str = selected_iids[0]
+        try: iid_int = int(iid_str); self.log_message(f"  Processing iid: {iid_str} (int: {iid_int})", "DEBUG")
+        except ValueError: self.log_message(f"  Bad iid '{iid_str}'.", "ERROR"); self.hex_editor_view.clear(); self.update_button_states(); return
+
+        if iid_int in self.tree_iid_to_entry: # Check mapping
+            entry = self.tree_iid_to_entry[iid_int]; self.log_message(f"  Selected is file: {entry.get_full_name()}", "DEBUG")
+            self.log_message(f"Loading '{entry.get_full_name()}' into Hex Editor..."); self.set_status(f"Loading {entry.get_full_name()}...")
             try:
                 self.log_message(f"  Calling get_entry_data...", "DEBUG"); data = self.arc.get_entry_data(entry, compressed=False)
                 data_len = len(data) if data is not None else "None"; self.log_message(f"  get_entry_data returned length: {data_len}", "DEBUG")
                 if data is None: messagebox.showerror("Load Error", f"Failed get data {entry.get_full_name()}."); self.hex_editor_view.clear()
                 else: self.log_message(f"  Calling hex_editor_view.load_data...", "DEBUG"); self.hex_editor_view.load_data(entry, data); self.log_message(f"  Finished hex_editor_view.load_data.", "DEBUG")
                 self.set_status(f"Viewing {entry.get_full_name()}")
-            except Exception as e: self.log_message(f"Error loading data for hex view: {e}\n{traceback.format_exc()}", "ERROR"); messagebox.showerror("Load Error", f"Failed load data:\n{e}"); self.hex_editor_view.clear(); self.set_status("Error loading data.")
-        else: self.log_message(f"  Selected item '{item_text}' is not a file entry.", "DEBUG"); self.hex_editor_view.clear(); self.set_status("Select a file to view hex.")
+            except Exception as e: self.log_message(f"Hex load error: {e}\n{traceback.format_exc()}", "ERROR"); messagebox.showerror("Load Error", f"Failed load data:\n{e}"); self.hex_editor_view.clear(); self.set_status("Error loading data.")
+        else:
+            try: item_text = self.tree.item(iid_str, "text")
+            except tk.TclError: item_text = f"[Item {iid_str} not found]"
+            self.log_message(f"  Selected item '{item_text}' (iid: {iid_str}) is not a file entry.", "DEBUG"); self.hex_editor_view.clear(); self.set_status("Select a file to view hex.")
         self.update_button_states()
 
+    # --- Popout/Popin/Apply Methods ---
     def popout_hex_editor(self):
-        # ... (popout_hex_editor - logic unchanged) ...
         if self.hex_editor_popup or not self.hex_editor_view.current_entry: self.log_message("Hex editor already popped out or no file loaded.", "WARN"); return
         self.hex_editor_popup = tk.Toplevel(self.root); self.hex_editor_popup.title(f"Hex Editor - {self.hex_editor_view.current_entry.get_full_name()}"); self.hex_editor_popup.geometry("800x600"); self.hex_editor_popup.configure(bg=BG_COLOR)
         self.hex_editor_popup.transient(self.root); self.hex_editor_popup.protocol("WM_DELETE_WINDOW", self.popin_hex_editor)
@@ -1016,9 +1017,7 @@ class MtArcToolApp:
         self.hex_editor_view.hex_toolbar.grid_forget(); self.hex_editor_view.hex_toolbar.master = popup_frame; self.hex_editor_view.hex_toolbar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 5))
         self.hex_editor_view.show_toolbar(); self.hex_editor_view.grid(row=1, column=0, sticky="nsew")
         self.log_message("Hex editor popped out."); self.update_button_states()
-
     def popin_hex_editor(self):
-        # ... (popin_hex_editor - logic unchanged) ...
         if not self.hex_editor_popup: return
         if self.hex_editor_view.current_entry and (self.hex_editor_view.hex_text.edit_modified() or self.hex_editor_view.ascii_text.edit_modified()):
              if messagebox.askyesno("Apply Changes?", "Apply changes before popping in?"): self.apply_hex_changes()
@@ -1027,22 +1026,19 @@ class MtArcToolApp:
         self.hex_editor_view.hex_toolbar.grid_forget(); self.hex_editor_view.hex_toolbar.master = self.hex_editor_frame_outer; self.hex_editor_view.hex_toolbar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 5))
         self.hex_editor_view.show_toolbar(); self.hex_editor_view.grid(row=1, column=0, sticky="nsew")
         self.hex_editor_popup.destroy(); self.hex_editor_popup = None; self.log_message("Hex editor popped in."); self.update_button_states()
-
     def apply_hex_changes(self):
-        # ... (apply_hex_changes - logic unchanged) ...
         if self.hex_editor_view and self.hex_editor_view.current_entry: self.hex_editor_view.apply_changes()
         else: self.log_message("Cannot apply hex changes: editor not ready.", "WARN")
 
     # --- Action Methods ---
     def open_arc(self):
-        # ... (open_arc - logic unchanged) ...
         if self.is_dirty:
              if not messagebox.askyesno("Unsaved Changes", "Discard unsaved changes and open a new file?"): return
         filepath = filedialog.askopenfilename(title="Open MT ARC File", filetypes=(("ARC files", "*.arc"), ("All files", "*.*")))
         if not filepath: return
         try:
             self.set_status(f"Loading {os.path.basename(filepath)}...")
-            if self.arc: self.arc.close(); self.hex_editor_view.clear()
+            if self.arc: self.arc.close(); self.hex_editor_view.clear() # Clear hex view on close/new open
             self.arc = MtArc(); self.arc.set_logger(self.log_message)
             self.arc.load(filepath)
             self.populate_tree(); self.set_status(f"Loaded {len(self.arc.entries)} files from {os.path.basename(filepath)}")
@@ -1050,7 +1046,6 @@ class MtArcToolApp:
         except Exception as e: self.log_message(f"Failed load {filepath}: {e}", "ERROR"); messagebox.showerror("Error Loading", f"Failed:\n{e}\n\nSee log."); self.arc = MtArc(); self.arc.set_logger(self.log_message); self.populate_tree(); self.mark_dirty(False)
         finally: self.update_button_states()
     def save_arc_as(self):
-        # ... (save_arc_as - logic unchanged) ...
         if not self.arc.entries and not self.is_dirty: messagebox.showwarning("Save Error", "No changes or entries to save."); return
         if self.hex_editor_view and self.hex_editor_view.current_entry and (self.hex_editor_view.hex_text.edit_modified() or self.hex_editor_view.ascii_text.edit_modified()):
             self.log_message("Applying hex changes before saving...", "INFO"); self.apply_hex_changes()
@@ -1065,7 +1060,6 @@ class MtArcToolApp:
         except Exception as e: messagebox.showerror("Error Saving", f"Failed:\n{e}\n\nSee log."); self.set_status("Saving failed")
         finally: self.update_button_states()
     def extract_selected(self):
-        # ... (extract_selected - logic unchanged) ...
         selected_entries = self.get_selected_entries()
         if not selected_entries: messagebox.showwarning("Extraction", "No files selected."); return
         output_dir = filedialog.askdirectory(title="Select Extraction Directory")
@@ -1081,7 +1075,6 @@ class MtArcToolApp:
             msg += f" in {end_time - start_time:.2f}s."; self.log_message(msg); self.set_status(msg, duration_ms=5000)
         except Exception as e: self.log_message(f"Extraction failed: {e}", "ERROR"); messagebox.showerror("Extraction Error", f"Error:\n{e}"); self.set_status("Extraction failed")
     def extract_all(self):
-        # ... (extract_all - logic unchanged) ...
         if not self.arc.entries: messagebox.showwarning("Extraction", "ARC empty."); return
         output_dir = filedialog.askdirectory(title="Select Extraction Directory for All Files")
         if not output_dir: return
@@ -1098,7 +1091,6 @@ class MtArcToolApp:
             msg += f" in {end_time - start_time:.2f}s."; self.log_message(msg); self.set_status(msg, duration_ms=5000)
         except Exception as e: self.log_message(f"Extraction failed: {e}", "ERROR"); messagebox.showerror("Extraction Error", f"Error:\n{e}"); self.set_status("Extraction failed")
     def add_files(self):
-        # ... (add_files - logic unchanged) ...
         if not self.arc.source_filepath and not self.arc.entries: messagebox.showwarning("Add Error", "Open or create an ARC first."); return
         files_to_add = filedialog.askopenfilenames(title="Select Files to Add")
         if not files_to_add: return
@@ -1113,7 +1105,6 @@ class MtArcToolApp:
         if added_count > 0: self.populate_tree(); self.mark_dirty(True); msg = f"Added {added_count} file(s) in {end_time - start_time:.2f}s. Save required."; self.log_message(msg); self.set_status(msg, duration_ms=5000)
         else: self.set_status("No files added.", duration_ms=3000)
     def remove_selected(self):
-        # ... (remove_selected - logic unchanged) ...
         selected_entries = self.get_selected_entries()
         if not selected_entries: messagebox.showwarning("Remove", "No files selected."); return
         confirm = messagebox.askyesno("Confirm Removal", f"Remove {len(selected_entries)} selected file(s)? Save required.")
@@ -1128,11 +1119,12 @@ class MtArcToolApp:
             if removed_current_hex: self.hex_editor_view.clear()
             self.populate_tree(); self.mark_dirty(True); msg = f"Removed {removed_count} file(s) in {end_time - start_time:.2f}s. Save required."; self.log_message(msg); self.set_status(msg, duration_ms=5000)
     def replace_selected(self):
-        # ... (replace_selected - logic unchanged) ...
         selected_items = self.tree.selection()
         if not selected_items: messagebox.showwarning("Replace", "No file selected."); return
         if len(selected_items) > 1: messagebox.showwarning("Replace", "Select only one file."); return
-        iid = selected_items[0]; tags = self.tree.item(iid, "tags")
+        iid = selected_items[0];
+        try: tags = self.tree.item(iid, "tags")
+        except tk.TclError: messagebox.showwarning("Replace", "Selected item no longer exists."); return
         if not tags or 'file' not in tags or len(tags) < 2 or not isinstance(tags[1], IMtEntryPy): messagebox.showwarning("Replace", "Selection is not a file."); return
         entry_to_replace = tags[1]
         file_to_import = filedialog.askopenfilename(title=f"Replace '{entry_to_replace.get_full_name()}'")
@@ -1143,19 +1135,17 @@ class MtArcToolApp:
             with open(file_to_import, 'rb') as f_rep: new_data = f_rep.read()
             if self.arc.replace_entry_data(entry_to_replace, new_data):
                 end_time = time.time()
-                if self.hex_editor_view.current_entry == entry_to_replace: self.hex_editor_view.load_data(entry_to_replace, new_data) # Reload hex view
+                if self.hex_editor_view.current_entry == entry_to_replace: self.hex_editor_view.load_data(entry_to_replace, new_data)
                 self.populate_tree(); self.mark_dirty(True); msg = f"Staged replacement '{entry_to_replace.get_full_name()}' in {end_time - start_time:.2f}s. Save required."; self.log_message(msg); self.set_status(msg, duration_ms=5000)
             else: self.set_status(f"Replacement failed.", duration_ms=3000)
         except Exception as e: self.log_message(f"Replace failed: {e}", "ERROR"); messagebox.showerror("Replace Error", f"Failed:\n{e}"); self.set_status("Replacement error.")
 
     # --- Batch Injection ---
     def open_batch_inject_dialog(self):
-        # ... (open_batch_inject_dialog - logic unchanged) ...
         if self.is_dirty: messagebox.showwarning("Unsaved Changes", "Save or discard changes before batch op."); return
         if self.arc and self.arc.source_filepath: self.log_message("Closing current ARC before batch op."); self.arc.close(); self.arc = MtArc(); self.arc.set_logger(self.log_message); self.populate_tree(); self.mark_dirty(False); self.hex_editor_view.clear()
         dialog = BatchInjectDialog(self); dialog.wait_window()
     def run_batch_injection(self, original_dir, modified_base_dir, output_dir, log_callback):
-        # ... (run_batch_injection - logic unchanged) ...
         arc_files_processed=0; arc_files_skipped=0; total_files_replaced=0; total_files_failed=0; start_batch_time=time.time()
         original_path=Path(original_dir); modified_base_path=Path(modified_base_dir); output_path=Path(output_dir)
         try: arc_filepaths=list(original_path.glob('*.arc'))
@@ -1191,7 +1181,6 @@ class MtArcToolApp:
         log_callback(f"Files Replaced: {total_files_replaced}"); log_callback(f"File Fails: {total_files_failed}")
 
     def on_exit(self):
-        # ... (on_exit - logic unchanged) ...
          if self.is_dirty:
               if not messagebox.askyesno("Exit", "Unsaved changes exist. Exit anyway?"): return
          if self.arc: self.arc.close()
@@ -1202,7 +1191,6 @@ class MtArcToolApp:
          self.root.destroy()
 
 # --- Batch Injection Dialog Class ---
-# ... (BatchInjectDialog class - unchanged) ...
 class BatchInjectDialog(tk.Toplevel):
     def __init__(self, app_instance): # Takes app instance
         super().__init__(app_instance.root) # Parent is app's root
@@ -1276,7 +1264,14 @@ class BatchInjectDialog(tk.Toplevel):
 # --- Main Execution ---
 if __name__ == "__main__":
     if not _crcmod_available:
-         if not messagebox.askyesno("Missing Dependency", "CRCmod library missing/failed.\nExtension hash lookups will not work.\nContinue anyway?"): import sys; sys.exit(1)
+         # Make the warning more prominent
+         root_check = tk.Tk()
+         root_check.withdraw() # Hide the small root window
+         if not messagebox.askyesno("Missing Dependency", "Python library 'crcmod' is required for correct extension handling but was not found or failed to load.\n\nInstall it using:\npython -m pip install crcmod\n\nContinue without correct extension handling (may cause errors)?", icon='warning'):
+              import sys
+              sys.exit(1)
+         root_check.destroy()
+
     root = tk.Tk()
     app = MtArcToolApp(root)
     root.mainloop()
