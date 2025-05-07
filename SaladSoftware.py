@@ -1,3 +1,8 @@
+# Handburger's MT Framework ARC Decryptor/Extractor
+# This script is a Python port of the original C# code from IcySon55's Kuriimu project.
+# It is designed to process and extract files from MT Framework ARC archives.
+# The script includes various utility functions, a GUI for user interaction, and support for Blowfish encryption/decryption.
+
 # --- IMPORTS ---
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
@@ -12,6 +17,7 @@ import queue
 import pathlib # For easier path manipulation and recursive glob
 import concurrent.futures # For parallel processing
 import traceback # For detailed error info
+import time # For timing operations
 from collections import namedtuple
 from Crypto.Cipher import Blowfish
 # from Crypto.Util.Padding import pad, unpad # Using manual null padding
@@ -32,7 +38,7 @@ FONT_FAMILY="JetBrains Mono";FONT_SIZE=10;FONT_SETTINGS=(FONT_FAMILY,FONT_SIZE)
 # --- Platform Enum ---
 class Platform: UNKNOWN=0; PC=1; CTR=2; PS3=3; Switch=4
 # --- ARC Constants ---
-DEFAULT_VERSION=7;DEFAULT_BYTE_ORDER_CHAR='<';DEFAULT_PLATFORM=Platform.Switch
+DEFAULT_VERSION=7;DEFAULT_BYTE_ORDER_CHAR='<';DEFAULT_PLATFORM=Platform.Switch # Default to Switch for rebuilds
 # --- Structs ---
 def format_struct(e, p): return e + p
 FMT_HEADER_COMMON="4sHH"; SIZE_HEADER_COMMON=8; FMT_HEADER_PC_EXTRA="I"; SIZE_HEADER_PC_EXTRA=4
@@ -43,6 +49,10 @@ ZLIB_COMPRESSION_LEVEL = 9; ALIGNMENT_SWITCH = 0x8000; ALIGNMENT_PC_DEFAULT = 0x
 MAGIC_ARC_LE=b'ARC\x00'; MAGIC_ARCC_LE=b'ARCC'; MAGIC_ARC_BE=b'\x00CRA'; MAGIC_HFS_LE=b'HFS\x00'; MAGIC_HFS_BE=b'\x00SFH'
 # --- Status Levels ---
 STATUS_INFO="info"; STATUS_SUCCESS="success"; STATUS_WARN="warn"; STATUS_ERROR="error"; STATUS_DEBUG="debug"
+# --- Parallel Processing ---
+MAX_WORKERS = os.cpu_count() * 2 if os.cpu_count() else 4
+MAX_WORKERS = max(4, MAX_WORKERS if MAX_WORKERS is not None else 4)
+MAX_WORKERS = min(MAX_WORKERS, 32)
 
 # --- Extension Map (Will be populated from file) ---
 EXTENSION_MAP = {}
@@ -51,6 +61,11 @@ EXTENSION_MAP_FILE = "extension_index_line.txt" # Name of the file to load
 
 
 # --- ARC UTILITIES & MTArc Class ---
+
+# --- Data Structures ---
+HFSHeader = namedtuple("HFSHeader", ["magic", "version", "type", "file_size", "padding"])
+HFSFooter = namedtuple("HFSFooter", ["hash1", "hash2"])
+ARCHeader = namedtuple("ARCHeader", ["magic", "version", "entry_count"])
 
 def create_file_info():
     """Creates a dictionary to hold file metadata and data."""
@@ -118,7 +133,7 @@ def get_full_filename(file_info):
         if not filename_bytes: name = ""
         else:
             # Try decoding with common encodings until successful or exhausted
-            for encoding in ['ascii','latin-1','utf-8']: # Try common encodings
+            for encoding in ['ascii','latin-1','utf-8','shift-jis']: # Try common encodings
                  try:
                       decoded_name = filename_bytes.split(b'\x00',1)[0].decode(encoding)
                       if decoded_name: # Ensure not empty
@@ -129,7 +144,7 @@ def get_full_filename(file_info):
                  except Exception: continue # Catch other potential errors
     except Exception: name = "decode_error_unknown" # Catch any unexpected errors during name decoding
 
-    # Look up extension hash in the loaded EXTENSION_MAP.
+    # Look up extension hash in the loaded EXTENSION_MAP. Provide default if hash not found.
     hash_val = file_info.get("ext_hash", 0)
     ext = EXTENSION_MAP.get(hash_val, f".{hash_val:08X}") # Use hash if not found in map
 
@@ -381,19 +396,26 @@ class MTArc:
          except Exception as e: raise RuntimeError(f"Key derive fail:{e}") from e
 
 
-    #def _setup_encryption(self, key1=None, key2=None):
-    #    """Sets up the crypto object if valid keys are provided."""
-    #    k1p=key1 is not None and key1!="";k2p=key2 is not None and key2!=""
-    #    if k1p!=k2p: raise ValueError("Both keys required or none");
-    #    if k1p and k2p:
-    #        try: dk=self._dk(k1,k2);self.crypto=MTBlowfishCrypto(dk);self.is_encrypted=True
-    #        except Exception as e: print(f"ERR:Encrypt init fail:{e}",file=sys.stderr);self.is_encrypted=False;self.crypto=None;raise
-    #    else: self.is_encrypted=False;self.crypto=None
+    def _setup_encryption(self, key1=None, key2=None):
+        """Sets up the crypto object if valid keys are provided."""
+        k1p=key1 is not None and key1!="";k2p=key2 is not None and key2!=""
+        if k1p!=k2p: raise ValueError("Both keys required or none");
+        if k1p and k2p:
+            try: 
+                dk=self._derive_mtf_key(key1,key2) 
+                self.crypto=MTBlowfishCrypto(dk)
+                self.is_encrypted=True
+            except Exception as e: print(f"ERR:Encrypt init fail:{e}",file=sys.stderr);self.is_encrypted=False;self.crypto=None;raise
+        else: self.is_encrypted=False;self.crypto=None
 
 
-    def load(self, filepath, key1=None, key2=None):
+    def load(self, filepath, key1=None, key2=None, status_queue=None): # Allow status_queue for more detailed warnings
         """Loads ARC data from a file, parsing headers, entries, and setting up for extraction."""
         self.files = []; self._raw_file_path = None; self._decrypted_entries_bytes = None; self._data_offset = 0; self._file_size = None
+
+        def _q_status(msg, level): # Helper to send to queue if available
+            if status_queue: status_queue.put({'type':'status','msg':msg,'level':level})
+            else: print(f"{level.upper()}: {msg}", file=sys.stderr)
 
         try:
             self._setup_encryption(key1, key2);
@@ -404,27 +426,27 @@ class MTArc:
             except Exception as e: raise IOError(f"Size get fail:{filepath}:{e}") from e
             if self._file_size < 4: raise IOError(f"Too small({self._file_size}b)");
 
-            with open(filepath,'rb') as f_raw:
+            with open(filepath,'rb')as f_raw:
                 mb=f_raw.read(4);f_raw.seek(0);self.byte_order_char='>'if mb==MAGIC_ARC_BE or mb==MAGIC_HFS_BE else'<';self.platform=Platform.PS3 if self.byte_order_char=='>'else Platform.PC
                 ishfs=mb==MAGIC_HFS_LE or mb==MAGIC_HFS_BE
                 if ishfs:
-                    hfs_header_fmt=format_struct(self.byte_order_char,FMT_HFS_HEADER)
+                    hfsfmt=format_struct(self.byte_order_char,FMT_HFS_HEADER);
                     if self._file_size<SIZE_HFS_HEADER: raise IOError("Short HFS hdr")
                     hfb=f_raw.read(SIZE_HFS_HEADER);
                     if len(hfb)<SIZE_HFS_HEADER: raise IOError(f"Incomplete HFS hdr read({len(hfb)}/{SIZE_HFS_HEADER})")
-                    try: self.hfs_header=namedtuple("HFSHeader",["magic","version","type","file_size","padding"])(*struct.unpack(hfs_header_fmt,hfb))
-                    except Exception as e: raise IOError(f"Parse HFS hdr fail:{e}")from e
-                    self.hfs_header_length=0x20000 if self.hfs_header.type==0 else 0x10; epah=f_raw.tell()+self.hfs_header_length
-                    if epah>self._file_size: raise IOError(f"Short HFS data({self.hfs_header_length}b)"); f_raw.seek(self.hfs_header_length,io.SEEK_CUR)
-                else: self.hfs_header=None;self.hfs_header_length=0
+                    try:self.hfs_header=HFSHeader(*struct.unpack(hfsfmt,hfb))
+                    except Exception as e:raise IOError(f"Parse HFS hdr fail:{e}")from e
+                    self.hfs_header_length=0x20000 if self.hfs_header.type==0 else 0x10;epah=f_raw.tell()+self.hfs_header_length
+                    if epah>self._file_size:raise IOError(f"Short HFS data({self.hfs_header_length}b)");f_raw.seek(self.hfs_header_length,io.SEEK_CUR)
+                else:self.hfs_header=None;self.hfs_header_length=0
                 rah=self._file_size-f_raw.tell()
-                if rah<SIZE_HEADER_COMMON: raise IOError(f"Short ARC hdr({SIZE_HEADER_COMMON}b exp,{rah}b rem)");
+                if rah<SIZE_HEADER_COMMON:raise IOError(f"Short ARC hdr({SIZE_HEADER_COMMON}b exp,{rah}b rem)");
                 hcf=format_struct(self.byte_order_char,FMT_HEADER_COMMON);hb=f_raw.read(SIZE_HEADER_COMMON)
-                if len(hb)<SIZE_HEADER_COMMON: raise IOError(f"Incomplete ARC hdr read({len(hb)}/{SIZE_HEADER_COMMON})")
-                try: self.arc_header=namedtuple("ARCHeader",["magic","version","entry_count"])(*struct.unpack(hcf,hb))
-                except Exception as e: raise IOError(f"Parse ARC hdr fail:{e}")from e
-                eam=MAGIC_ARC_BE if self.byte_order_char=='>'else MAGIC_ARC_LE; eam2=MAGIC_ARCC_LE if self.byte_order_char=='<'else b'';
-                if self.arc_header.magic not in[eam,eam2]: print(f"W:Unusual ARC magic:{self.arc_header.magic!r}",file=sys.stderr)
+                if len(hb)<SIZE_HEADER_COMMON:raise IOError(f"Incomplete ARC hdr read({len(hb)}/{SIZE_HEADER_COMMON})")
+                try:self.arc_header=ARCHeader(*struct.unpack(hcf,hb))
+                except Exception as e:raise IOError(f"Parse ARC hdr fail:{e}")from e
+                eam=MAGIC_ARC_BE if self.byte_order_char=='>'else MAGIC_ARC_LE;eam2=MAGIC_ARCC_LE if self.byte_order_char=='<'else b'';
+                if self.arc_header.magic not in[eam,eam2]and not ishfs:_q_status(f"W:Unusual ARC magic:{self.arc_header.magic!r}",STATUS_WARN)
                 self.header_length=SIZE_HEADER_COMMON;v=self.arc_header.version
                 if self.byte_order_char=='>':self.platform=Platform.PS3
                 elif v==9:self.platform=Platform.Switch;self.entry_struct_fmt=format_struct('<',FMT_ENTRY_SWITCH);self.entry_struct_size=SIZE_ENTRY_SWITCH
@@ -432,28 +454,27 @@ class MTArc:
                 else:self.platform=Platform.PC;self.entry_struct_fmt=format_struct('<',FMT_ENTRY);self.entry_struct_size=SIZE_ENTRY
                 if self.byte_order_char=='<'and v not in[7,9]:
                     if f_raw.tell()+SIZE_HEADER_PC_EXTRA<=self._file_size:f_raw.read(SIZE_HEADER_PC_EXTRA);self.header_length+=SIZE_HEADER_PC_EXTRA
-                    else:print(f"W:Exp pad v{v} LE, file short.",file=sys.stderr)
+                    else:_q_status(f"W:Exp pad v{v} LE, file short.",STATUS_WARN)
                 mre=1000000;ec=self.arc_header.entry_count
-                if ec is None or not isinstance(ec,int)or ec<0 or ec>mre: raise ValueError(f"Invalid entries({ec}).Corrupt?");
-                emsu=ec*self.entry_struct_size;rahs=self._file_size-f_raw.tell()
-                etp=ec #EntriesToProcess
+                if ec is None or not isinstance(ec,int)or ec<0 or ec>mre:raise ValueError(f"Invalid entries({ec}).Corrupt?");
+                emsu=ec*self.entry_struct_size;rahs=self._file_size-f_raw.tell();etp=ec
                 if rahs<emsu:
-                    print(f"W:File short metadata({emsu}b exp,{rahs}b rem).Partial read.",file=sys.stderr);
+                    _q_status(f"W:File short metadata({emsu}b exp,{rahs}b rem).Partial read.",STATUS_WARN);
                     mbrr=rahs-(rahs%self.entry_struct_size);etp=mbrr//self.entry_struct_size if self.entry_struct_size>0 else 0
                     if etp==0 and ec>0:raise IOError("File too short for 1 entry.")
-                    print(f"W:Will read {etp} entries.",file=sys.stderr)
+                    _q_status(f"W:Will read {etp} entries.",STATUS_WARN)
                 else:mbrr=emsu
                 mbr=f_raw.read(mbrr);
                 if len(mbr)!=mbrr:raise IOError(f"Incomplete metadata read({len(mbr)}/{mbrr})");
                 mbd=mbr
                 if self.is_encrypted and self.crypto:
                     try:mbd=self.crypto.decrypt_ecb(mbr)
-                    except Exception as e:print(f"W:Meta decrypt fail:{e}.Parsing raw.",file=sys.stderr);mbd=mbr
-                self._decrypted_entries_bytes=mbd;bap=len(self._decrypted_entries_bytes);netp=bap//self.entry_struct_size if self.entry_struct_size>0 else 0 #NumEntriesToParse
-                if netp<etp:print(f"W:Only {netp} entries fit decrypted meta.Hdr said {ec}.",file=sys.stderr)
+                    except Exception as e:_q_status(f"W:Meta decrypt fail:{e}.Parsing raw.",STATUS_WARN);mbd=mbr
+                self._decrypted_entries_bytes=mbd;bap=len(self._decrypted_entries_bytes);netp=bap//self.entry_struct_size if self.entry_struct_size>0 else 0
+                if netp<etp:_q_status(f"W:Only {netp} entries fit decrypted meta.Hdr said {ec}.",STATUS_WARN)
                 for i in range(netp):
                     eso=i*self.entry_struct_size;eeo=eso+self.entry_struct_size
-                    if bap<eeo:print(f"W:Meta block short parse.Cannot parse e{i+1}+.",file=sys.stderr);break
+                    if bap<eeo:_q_status(f"W:Meta block short parse.Cannot parse e{i+1}+.",STATUS_WARN);break
                     ed=self._decrypted_entries_bytes[eso:eeo];fi=create_file_info();fi["platform"]=self.platform
                     try:
                         up=struct.unpack(self.entry_struct_fmt,ed)
@@ -461,31 +482,27 @@ class MTArc:
                         else:fi.update(zip(["filename_base","ext_hash","compressed_size","uncompressed_size_raw","offset"],up));fi["unknown1"]=None
                         csz=fi.get("compressed_size");calcsz=get_calculated_uncompressed_size(fi);fi["is_compressed"]=True if(self.platform==Platform.Switch and csz is not None and csz>0)or(csz is not None and calcsz is not None and csz>0 and csz!=calcsz)else False
                         fi["full_filename"]=get_full_filename(fi);fi["calculated_uncompressed_size"]=calcsz
-                        if csz is None or not isinstance(csz,int)or csz<0:print(f"W:File'{fi['full_filename']}'e{i+1} invalid comp size({csz}).Skip.",file=sys.stderr);continue
-                        if calcsz is not None and calcsz<0:print(f"W:File'{fi['full_filename']}'e{i+1} neg uncomp size({calcsz}).",file=sys.stderr)
+                        if csz is None or not isinstance(csz,int)or csz<0:_q_status(f"W:File'{fi['full_filename']}'e{i+1} invalid comp size({csz}).Skip.",STATUS_WARN);continue
+                        if calcsz is not None and calcsz<0:_q_status(f"W:File'{fi['full_filename']}'e{i+1} neg uncomp size({calcsz}).",STATUS_WARN)
                         offset_val=fi.get("offset");
-                        if offset_val is None or not isinstance(offset_val,int)or offset_val<0:print(f"W:File'{fi['full_filename']}'e{i+1} invalid offset({offset_val}).Skip.",file=sys.stderr);continue
+                        if offset_val is None or not isinstance(offset_val,int)or offset_val<0:_q_status(f"W:File'{fi['full_filename']}'e{i+1} invalid offset({offset_val}).Skip.",STATUS_WARN);continue
                         data_end_potential=offset_val+csz;arc_section_size=self._file_size-self.hfs_header_length
-                        if data_end_potential>arc_section_size:print(f"W:File'{fi['full_filename']}'e{i+1} data end({data_end_potential})>ARC end({arc_section_size}).Read partial?",file=sys.stderr)
+                        if data_end_potential>arc_section_size:_q_status(f"W:File'{fi['full_filename']}'e{i+1} data end({data_end_potential})>ARC end({arc_section_size}).Read partial?",STATUS_WARN)
                         self.files.append(fi)
-                    except Exception as e:print(f"Err parse entry{i+1}data:{e}.Skip.",file=sys.stderr);
-                    status_queue.put({'type':'status','msg':f"Err parse entry{i+1}:{e}.Skip.",'level':STATUS_WARN}) if 'status_queue' in locals() else None
-                if len(self.files)<ec:print(f"W:Parsed {len(self.files)}/{ec} entries.",file=sys.stderr);
-                status_queue.put({'type':'status','msg':f"W:Parsed{len(self.files)}/{ec} entries due to issues.",'level':STATUS_WARN}) if 'status_queue' in locals() else None
+                    except Exception as e:_q_status(f"Err parse entry{i+1}data:{e}.Skip.",STATUS_WARN)
+                if len(self.files)<ec:_q_status(f"W:Parsed {len(self.files)}/{ec} entries due to issues.",STATUS_WARN)
                 self._data_offset=0
                 if self.files:self._data_offset=self.files[0].get("offset",0)
-                dsap=self.hfs_header_length+self._data_offset;capmb=f_raw.tell() #CurrentPosAfterMetadataBlock
-                if dsap<capmb and len(self.files)>0:print(f"W:Data offset({self._data_offset},abs{dsap})in meta(ends near{capmb}).",file=sys.stderr);status_queue.put({'type':'status','msg':f"W:Data offset({self._data_offset})in meta.Extract fail?",'level':STATUS_WARN}) if 'status_queue' in locals() else None
-                if dsap>self._file_size:print(f"W:Data offset({self._data_offset},abs{dsap})>file end({self._file_size}).Extract fail.",file=sys.stderr);status_queue.put({'type':'status','msg':"W:Data offset>file end.Extract fail?",'level':STATUS_WARN}) if 'status_queue' in locals() else None
-        except (FileNotFoundError, PermissionError, IOError, ValueError, RuntimeError) as e: raise e
-        except Exception as e: raise IOError(f"Load fail {os.path.basename(filepath)}:{e}")from e
+                dsap=self.hfs_header_length+self._data_offset;capmb=f_raw.tell()
+                if dsap<capmb and len(self.files)>0:_q_status(f"W:Data offset({self._data_offset},abs{dsap})in meta(ends near{capmb}).",STATUS_WARN)
+                if dsap>self._file_size:_q_status(f"W:Data offset({self._data_offset},abs{dsap})>file end({self._file_size}).Extract fail.",STATUS_WARN)
+        except (FileNotFoundError,PermissionError,IOError,ValueError,RuntimeError)as e:raise e
+        except Exception as e:raise IOError(f"Load fail {os.path.basename(filepath)}:{e}")from e
 
     def extract_file(self, file_info, input_arc_path):
-        """Reads, decrypts, and decompresses file data for a single file_info."""
-        if not self._raw_file_path or self._raw_file_path != input_arc_path or self._file_size is None:
-             raise RuntimeError(f"MTArc object state invalid for extraction of '{file_info.get('full_filename', '?')}'. Did load() complete successfully for {os.path.basename(input_arc_path)}?")
+        if not self._raw_file_path or self._raw_file_path!=input_arc_path or self._file_size is None:raise RuntimeError(f"MTArc state invalid for '{file_info.get('full_filename','?')}'.Load fail for {os.path.basename(input_arc_path)}?")
         try:offset=int(file_info.get("offset",0));hfs_len=int(self.hfs_header_length);d_off=offset+hfs_len
-        except Exception as e:raise ValueError(f"Invalid offset/HFS length '{file_info.get('full_filename','?')}':{e}")from e
+        except Exception as e:raise ValueError(f"Invalid offset/HFS len '{file_info.get('full_filename','?')}':{e}")from e
         rs=file_info.get("compressed_size");raw=b''
         if rs is None or not isinstance(rs,int)or rs<0:print(f"W:Skip extract '{file_info.get('full_filename','?')}'invalid comp size({rs}).",file=sys.stderr);return b''
         if rs==0:return b''
@@ -514,460 +531,385 @@ class MTArc:
         expsz=file_info.get("calculated_uncompressed_size");actsz=len(fin)
         if expsz is None or not isinstance(expsz,int)or expsz<0:print(f"W:Invalid exp uncomp size({expsz})'{file_info.get('full_filename','?')}'.No truncate.",file=sys.stderr)
         elif actsz>expsz:fin=fin[:expsz] # Truncate excess
-        # *** REMOVED WARNING for actual_size < expected_size ***
-        #elif actsz<expsz: print(f"W:Final size {actsz} < exp {expsz} '{file_info.get('full_filename','?')}'.Incomplete?",file=sys.stderr)
+        # elif actsz<expsz: print(f"W:Final size {actsz} < exp {expsz} '{file_info.get('full_filename','?')}'.Incomplete?",file=sys.stderr) # Warning removed
         return fin
 
     def save(self, output_path, input_file_infos, key1=None, key2=None):
-        """Builds an ARC file (forced as Switch v9), handling encryption."""
-        if not input_file_infos: raise ValueError("No files provided for saving.")
-        if not isinstance(input_file_infos, list): raise TypeError("input_file_infos must be a list.")
+        if not input_file_infos:raise ValueError("No files");
+        if not isinstance(input_file_infos,list):raise TypeError("input_file_infos not list");
         try:
-            self._se(k1, k2); # Setup crypto
-            self.platform=Platform.Switch; self.byte_order_char='<'; v=9; self.entry_struct_fmt=format_struct('<',FMT_ENTRY_SWITCH); self.entry_struct_size=SIZE_ENTRY_SWITCH; self.header_length=SIZE_HEADER_COMMON;
-            initial_ec=len(input_file_infos) # Initial EntryCount
-            ds=io.BytesIO(); updated_file_infos=[];
-            temp_md_size=initial_ec*self.entry_struct_size; temp_md_end=self.header_length+temp_md_size; al=ALIGNMENT_SWITCH; temp_data_start=(temp_md_end+al-1)&~(al-1);
-            cdo=temp_data_start # Current data offset absolute
-            for idx, fi in enumerate(input_file_infos):
-                if not isinstance(fi,dict): print(f"W:Skip invalid item {idx} (not dict).",file=sys.stderr);continue
-                od=fi.get("data"); fn=fi.get("full_filename","unknown file")
-                if od is None: print(f"W:No data key '{fn}'.Empty.",file=sys.stderr);od=b''
-                elif not isinstance(od,bytes): print(f"W:Data not bytes '{fn}'({type(od).__name__}).Empty.",file=sys.stderr);od=b''
-                us=len(od); cd=b''; dtw=b'' # UncompressedSize, CompressedData, DataToWrite
+            self._setup_encryption(key1,key2); 
+            self.platform=Platform.Switch;self.byte_order_char='<';v=9;self.entry_struct_fmt=format_struct('<',FMT_ENTRY_SWITCH);self.entry_struct_size=SIZE_ENTRY_SWITCH;self.header_length=SIZE_HEADER_COMMON;
+            initial_ec=len(input_file_infos);ds=io.BytesIO();updated_file_infos=[];
+            temp_md_size=initial_ec*self.entry_struct_size;temp_md_end=self.header_length+temp_md_size;al=ALIGNMENT_SWITCH;temp_data_start=(temp_md_end+al-1)&~(al-1);
+            cdo=temp_data_start
+            for idx,fi in enumerate(input_file_infos):
+                if not isinstance(fi,dict):print(f"W:Skip invalid item {idx} (not dict).",file=sys.stderr);continue
+                od=fi.get("data");fn=fi.get("full_filename","unknown file")
+                if od is None:print(f"W:No data key '{fn}'.Empty.",file=sys.stderr);od=b''
+                elif not isinstance(od,bytes):print(f"W:Data not bytes '{fn}'({type(od).__name__}).Empty.",file=sys.stderr);od=b''
+                us=len(od);cd=b'';dtw=b''
                 if us>0:
-                    try: cd=compress_kontract_zlib(od)
-                    except Exception as e: print(f"ERR:Zlib compress fail '{fn}':{e}.Store raw.",file=sys.stderr);cd=od
+                    try:cd=compress_kontract_zlib(od)
+                    except Exception as e:print(f"ERR:Zlib compress fail '{fn}':{e}.Store raw.",file=sys.stderr);cd=od
                 dtw=cd
                 if self.is_encrypted:
-                    if not self.crypto: raise RuntimeError("Encrypt but no crypto");
-                    try: dtw=self.crypto.encrypt_ecb(dtw)
-                    except Exception as e: print(f"ERR:Blowfish encrypt data fail '{fn}':{e}.Store plain.",file=sys.stderr);dtw=cd
-                fi_to_save=fi.copy(); fi_to_save["offset"]=cdo; fi_to_save["compressed_size"]=len(dtw); fi_to_save["uncompressed_size_raw"]=us; fi_to_save["unknown1"]=fi_to_save.get("unknown1",0);
-                try: ds.write(dtw)
-                except Exception as e: raise IOError(f"Write temp stream fail '{fn}':{e}")from e
-                cdo+=len(dtw); updated_file_infos.append(fi_to_save)
+                    if not self.crypto:raise RuntimeError("Encrypt but no crypto");
+                    try:dtw=self.crypto.encrypt_ecb(dtw)
+                    except Exception as e:print(f"ERR:Blowfish encrypt data fail '{fn}':{e}.Store plain.",file=sys.stderr);dtw=cd
+                fi_to_save=fi.copy();fi_to_save["offset"]=cdo;fi_to_save["compressed_size"]=len(dtw);fi_to_save["uncompressed_size_raw"]=us;fi_to_save["unknown1"]=fi_to_save.get("unknown1",0);
+                try:ds.write(dtw)
+                except Exception as e:raise IOError(f"Write temp stream fail '{fn}':{e}")from e
+                cdo+=len(dtw);updated_file_infos.append(fi_to_save)
             try:
-                output_p=pathlib.Path(output_path); output_p.parent.mkdir(parents=True,exist_ok=True)
-                with open(output_p, 'wb') as f:
-                    f.write(b'\x00'*self.header_length) # Placeholder header
-                    mdb_plain=bytearray(); packed_entry_count=0
+                output_p=pathlib.Path(output_path);output_p.parent.mkdir(parents=True,exist_ok=True)
+                with open(output_p,'wb')as f:
+                    f.write(b'\x00'*self.header_length);mdb_plain=bytearray();packed_entry_count=0
                     for fi in updated_file_infos:
                         fnb=fi.get("filename_base");fn=fi.get("full_filename","?")
-                        if not fnb: bn=os.path.splitext(fn)[0]; 
+                        if not fnb:bn=os.path.splitext(fn)[0];
                         try:fnb=bn.encode('ascii')
                         except UnicodeEncodeError:fnb=bn.encode('utf-8',errors='ignore')
                         filename_bytes=fnb
                         pn=filename_bytes[:64].ljust(64,b'\x00')
                         ev=(pn,fi.get("ext_hash",0),fi.get("compressed_size",0),fi.get("uncompressed_size_raw",0),fi.get("unknown1",0),fi.get("offset",0))
-                        if ev[2]is None or not isinstance(ev[2],int)or ev[2]<0 or ev[5]is None or not isinstance(ev[5],int)or ev[5]<0: print(f"W:Skip pack entry '{fn}':Invalid size({ev[2]})or offset({ev[5]}).",file=sys.stderr);continue
-                        try: packed_entry=struct.pack(self.entry_struct_fmt,*ev); mdb_plain.extend(packed_entry); packed_entry_count+=1
-                        except Exception as e: print(f"ERR:Pack entry fail '{fn}':{e}.Skip.",file=sys.stderr)
-                    mdr=bytes(mdb_plain); mtw=mdr;
+                        if ev[2]is None or not isinstance(ev[2],int)or ev[2]<0 or ev[5]is None or not isinstance(ev[5],int)or ev[5]<0:print(f"W:Skip pack entry '{fn}':Invalid size({ev[2]})or offset({ev[5]}).",file=sys.stderr);continue
+                        try:packed_entry=struct.pack(self.entry_struct_fmt,*ev);mdb_plain.extend(packed_entry);packed_entry_count+=1
+                        except Exception as e:print(f"ERR:Pack entry fail '{fn}':{e}.Skip.",file=sys.stderr)
+                    mdr=bytes(mdb_plain);mtw=mdr;
                     if self.is_encrypted:
-                        if not self.crypto: raise RuntimeError("Encrypt but no crypto");
-                        try: mtw=self.crypto.encrypt_ecb(mdr)
-                        except Exception as e: print(f"ERR:Blowfish encrypt meta fail:{e}.Store plain.",file=sys.stderr);mtw=mdr
-                    f.write(mtw)
-                    meta_end_actual=self.header_length+len(mtw); data_start_actual=(meta_end_actual+al-1)&~(al-1);
+                        if not self.crypto:raise RuntimeError("Encrypt but no crypto");
+                        try:mtw=self.crypto.encrypt_ecb(mdr)
+                        except Exception as e:print(f"ERR:Blowfish encrypt meta fail:{e}.Store plain.",file=sys.stderr);mtw=mdr
+                    f.write(mtw);
+                    meta_end_actual=self.header_length+len(mtw);data_start_actual=(meta_end_actual+al-1)&~(al-1);
                     pad=data_start_actual-f.tell();
-                    if pad<0: raise RuntimeError(f"Internal ERR:Data start({data_start_actual})<meta end({f.tell()})");
-                    if pad>0: f.write(b'\x00'*pad)
-                    if f.tell()!=data_start_actual: raise RuntimeError(f"Internal ERR:Stream pos({f.tell()})!=data start({data_start_actual})")
-                    f.write(ds.getvalue())
-                    f.seek(0)
+                    if pad<0:raise RuntimeError(f"Internal ERR:Data start({data_start_actual})<meta end({f.tell()})");
+                    if pad>0:f.write(b'\x00'*pad)
+                    if f.tell()!=data_start_actual:raise RuntimeError(f"Internal ERR:Stream pos({f.tell()})!=data start({data_start_actual})")
+                    f.write(ds.getvalue());f.seek(0)
                     f.write(struct.pack(format_struct(self.byte_order_char,FMT_HEADER_COMMON),MAGIC_ARC_LE,v,packed_entry_count)) # Use final count
             except Exception as e:
-                 print(f"ERR:Write output fail {output_path}:{e}",file=sys.stderr);
-                 if os.path.exists(output_path): 
-                    try: os.remove(output_path)
-                    except Exception as ce: print(f"W:Cleanup fail {output_path}:{ce}",file=sys.stderr)
-                 raise RuntimeError(f"Save fail {os.path.basename(output_path)}:{e}")from e
-        except Exception as e: raise RuntimeError(f"Save prepare fail:{e}")from e
+                print(f"ERR:Write output fail {output_path}:{e}",file=sys.stderr);
+                if os.path.exists(output_path):
+                    try:os.remove(output_path)
+                    except Exception as ce:print(f"W:Cleanup fail {output_path}:{ce}",file=sys.stderr)
+                raise RuntimeError(f"Save fail {os.path.basename(output_path)}:{e}")from e
+        except Exception as e:raise RuntimeError(f"Save prepare fail:{e}")from e
+    def close(self):pass
 
-    def close(self): pass
 
 # --- BATCH OPERATIONS (Workers and Orchestrators) ---
 
+# Worker for single file/folder based extraction
 # _list_extract_worker(arc_path_str, output_base_dir_str, key1, key2, status_queue)
-def _list_extract_worker(arc_path_str: str, output_base_dir_str: str, key1: str | None, key2: str | None, status_queue: queue.Queue):
-    """Worker to extract a single ARC file from a list or recursive scan."""
+def _list_extract_worker(arc_path_str: str, output_base_dir_str: str | None, key1: str | None, key2: str | None, status_queue: queue.Queue):
+    """
+    Worker to extract a single ARC file.
+    Output folder will be created in the same directory as arc_path_str, named <arc_stem>_arc.
+    output_base_dir_str is ignored by this worker.
+    """
     arc_path = pathlib.Path(arc_path_str)
-    output_base_dir = pathlib.Path(output_base_dir_str)
-    arc = None # Initialize arc object
+    # output_base_dir_str is ignored; output is relative to arc_path.
+    arc = None 
 
     try:
         arc_filename = arc_path.name
         arc_basename = arc_path.stem
-        output_folder = output_base_dir / arc_basename
+        # MODIFIED: Output folder is next to the source ARC file
+        output_folder = arc_path.parent / f"{arc_basename}_arc"
+
 
         status_queue.put({'type': 'status', 'msg': f"Loading {arc_filename}...", 'level': STATUS_DEBUG})
 
-        # Load the ARC file - MTArc.load handles key setup and parsing, and raises exceptions on failure
         arc = MTArc()
-        # Pass status_queue to load for more detailed warnings/errors during parsing? No, load prints directly.
-        arc.load(str(arc_path), key1=key1, key2=key2) # Load can raise exceptions
+        arc.load(str(arc_path), key1=key1, key2=key2, status_queue=status_queue)
 
-        # Ensure output folder exists
         try: output_folder.mkdir(parents=True, exist_ok=True)
         except Exception as e:
              raise IOError(f"Failed to create output folder {output_folder}: {e}") from e
+        if not os.access(output_folder, os.W_OK):
+            raise PermissionError(f"Write permission denied for output folder: {output_folder}")
 
 
         platform_name = Platform(arc.platform).name if isinstance(arc.platform, Platform) else f"Platform {arc.platform}"
-        status_queue.put({'type': 'status', 'msg': f" Extracting {len(arc.files)} files from {platform_name} ARC {arc_filename} to {output_folder.name}...", 'level': STATUS_INFO})
+        status_queue.put({'type': 'status', 'msg': f" Extracting {len(arc.files)} files from {platform_name} ARC {arc_filename} to ./{output_folder.relative_to(arc_path.parent)}...", 'level': STATUS_INFO})
 
-        # Process files within this ARC
+
         processed_count = 0
         error_count = 0
         for file_info in arc.files:
-            # Defensive check for file_info structure
             if not isinstance(file_info, dict) or "full_filename" not in file_info or "offset" not in file_info or "compressed_size" not in file_info:
                  status_queue.put({'type':'status','msg':f"  Skipping invalid file info in {arc_filename}: {file_info!r}",'level':STATUS_WARN})
-                 error_count += 1 # Count as a file that couldn't be processed
-                 continue # Skip this file info
+                 error_count += 1 
+                 continue 
 
             try:
-                # extract_file uses the loaded arc object's state and path
-                file_data = arc.extract_file(file_info, str(arc_path)) # Pass arc_path for consistency
+                file_data = arc.extract_file(file_info, str(arc_path)) 
 
-                # Construct the full output path including subdirectories from the filename
-                # Use pathlib, it handles separators correctly.
-                relative_file_path_str = file_info.get("full_filename", "") # Defensive get
-                # Sanitize filename components minimally to prevent path traversal or invalid names
+                relative_file_path_str = file_info.get("full_filename", "") 
                 safe_components = []
-                # Split path, sanitize each component individually
                 for component in pathlib.Path(relative_file_path_str).parts:
-                    # Remove/replace problematic characters. Example: ':' on Windows, null bytes, .. for traversal.
                     safe_comp = component.replace(':', '_').replace('\x00', '').replace('..', '__')
-                    # Add more replacements if needed based on OS
-                    # Windows invalid chars: < > : " / \ | ? *
                     safe_comp = safe_comp.replace('<', '_').replace('>', '_').replace('"', '_').replace('|', '_').replace('?', '_').replace('*', '_').replace('/', '_').replace('\\', '_')
-
-                    # Avoid adding empty components unless it's the root (not applicable here as we start relative)
                     if safe_comp:
                          safe_components.append(safe_comp)
 
-                # Handle case where filename is empty or only separators resulted in no safe components
                 if not safe_components:
                      status_queue.put({'type':'status','msg':f"  Skipping entry with invalid/empty derived filename in {arc_filename}",'level':STATUS_WARN})
                      error_count += 1
                      continue
 
-                # Create the safe path relative to the output folder
-                # Join components robustly using joinpath
                 output_file_path = output_folder.joinpath(*safe_components)
-
-                # Ensure parent directories exist for the specific file path
                 output_file_path.parent.mkdir(parents=True, exist_ok=True)
 
-                # Write the extracted file data
                 with open(output_file_path, 'wb') as out_f: out_f.write(file_data)
                 processed_count += 1
 
-            except OSError as e: # Catch OS errors like invalid filename characters or path issues
+            except OSError as e: 
                  status_queue.put({'type': 'status', 'msg': f"  OS Error writing '{file_info.get('full_filename','?')}' from {arc_filename}: {e}", 'level': STATUS_ERROR})
-                 status_queue.put({'type':'status','msg':f"  Trace: {traceback.format_exc()}",'level':STATUS_DEBUG}) # Log traceback for debug info
+                 status_queue.put({'type':'status','msg':f"  Trace: {traceback.format_exc()}",'level':STATUS_DEBUG}) 
                  error_count += 1
             except Exception as e:
-                # Log error for this specific file extraction, but continue with the next file in the ARC
                 status_queue.put({'type': 'status', 'msg': f"  Error extracting '{file_info.get('full_filename','?')}' from {arc_filename}: {e}", 'level': STATUS_ERROR})
-                status_queue.put({'type':'status','msg':f"  Trace: {traceback.format_exc()}",'level':STATUS_DEBUG}) # Log traceback for debug info
+                status_queue.put({'type':'status','msg':f"  Trace: {traceback.format_exc()}",'level':STATUS_DEBUG}) 
                 error_count += 1
 
-        # Check if any files were successfully processed
         if processed_count > 0 and error_count == 0:
-            # All files extracted successfully
             status_queue.put({'type': 'status', 'msg': f"Finished extracting {arc_filename} ({processed_count} files)", 'level': STATUS_SUCCESS})
-            return arc_filename, True # Signal overall success for this ARC
+            return arc_filename, True 
         elif processed_count > 0 and error_count > 0:
-            # Some files extracted, some failed
             status_queue.put({'type': 'status', 'msg': f"Finished extracting {arc_filename} with errors ({processed_count} successful, {error_count} failed)", 'level': STATUS_WARN})
-            return arc_filename, False # Signal partial success/warning for this ARC
+            return arc_filename, False 
         elif error_count > 0:
-             # No files extracted, only errors occurred within the ARC
              status_queue.put({'type': 'status', 'msg': f"Failed to extract any files from {arc_filename} ({error_count} errors)", 'level': STATUS_ERROR})
-             return arc_filename, False # Signal total failure for this ARC
-        else: # Should only happen if arc.files was empty (valid case)
+             return arc_filename, False 
+        else: 
              status_queue.put({'type': 'status', 'msg': f"No files found in {arc_filename}.", 'level': STATUS_INFO})
-             return arc_filename, True # Treat as success if ARC was empty
+             return arc_filename, True 
 
 
     except (FileNotFoundError, PermissionError, IOError, ValueError, RuntimeError) as e:
-         # Catch specific anticipated errors from load or setup
          status_queue.put({'type':'status','msg':f"Failed loading/processing ARC {arc_path.name}: {e}",'level':STATUS_ERROR}); return arc_path.name,False
     except Exception as e:
-        # Catch any other unexpected errors during ARC loading or initial setup
         status_queue.put({'type': 'status', 'msg': f"An unexpected error occurred processing ARC {arc_path.name}: {e}", 'level': STATUS_ERROR})
-        status_queue.put({'type':'status','msg':f"Trace: {traceback.format_exc()}",'level':STATUS_DEBUG}) # Log traceback for debug info
-        return arc_path.name, False # Signal failure
+        status_queue.put({'type':'status','msg':f"Trace: {traceback.format_exc()}",'level':STATUS_DEBUG}) 
+        return arc_path.name, False 
 
     finally:
-        # Ensure MTArc resources are closed (though currently doesn't hold files open persistently)
         if arc: arc.close()
 
 
 # Worker for single folder based injection
 # _list_inject_worker(source_folder_str, output_rebuilt_dir_str, key1, key2, status_queue)
 # Also used for Folder Inject Dir
-def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str, key1: str | None, key2: str | None, status_queue: queue.Queue):
+def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str | None, key1: str | None, key2: str | None, status_queue: queue.Queue):
     """Worker to rebuild a single ARC from a source folder."""
     source_folder_path = pathlib.Path(source_folder_str)
+    # output_rebuilt_dir_str is required for injection.
+    if not output_rebuilt_dir_str:
+        status_queue.put({'type':'status','msg':f"Output directory for rebuild not provided for {source_folder_path.name}.", 'level':STATUS_ERROR})
+        return source_folder_path.name, False
     output_rebuilt_dir = pathlib.Path(output_rebuilt_dir_str)
-    arc = None # Initialize arc object
+    arc = None 
 
     try:
-        folder_name = source_folder_path.name
-        output_arc_path = output_rebuilt_dir / f"{folder_name}.arc"
-        status_queue.put({'type': 'status', 'msg': f"Processing folder {folder_name} for rebuild...", 'level': STATUS_DEBUG})
+        folder_name_raw = source_folder_path.name 
+        arc_base_name = folder_name_raw
+        if folder_name_raw.endswith("_arc"):
+            arc_base_name = folder_name_raw[:-4]
+
+        output_arc_path = output_rebuilt_dir / f"{arc_base_name}.arc"
+
+        status_queue.put({'type': 'status', 'msg': f"Processing folder {folder_name_raw} for rebuild as {output_arc_path.name}...", 'level': STATUS_DEBUG})
 
         files_to_pack = []
-        has_files_in_folder = False # Flag to check if folder contains any files
-        error_reading_files = False # Flag to track if any file read errors occurred
+        has_files_in_folder = False 
+        error_reading_files = False 
 
-        # Use scandir and handle potential errors during directory listing or file reading
         try:
-            # Ensure source folder exists and is accessible
             if not source_folder_path.is_dir():
                  raise FileNotFoundError(f"Source folder not found: {source_folder_path.name}")
             if not os.access(source_folder_path, os.R_OK):
                  raise PermissionError(f"Read permission denied for folder: {source_folder_path.name}")
 
-            # Iterate through top-level entries in the source folder
             for entry in os.scandir(source_folder_path):
-                # Check if entry is a file and readable
                 try:
                     if entry.is_file():
                         has_files_in_folder = True
                         filename = entry.name; full_path = entry.path
-                        # status_queue.put({'type':'status','msg':f"  Adding {filename}",'level':STATUS_DEBUG}) # Too noisy
-                        # Check read permission for the file itself
                         if not os.access(full_path, os.R_OK):
-                            status_queue.put({'type':'status','msg':f"  Permission denied reading file {filename} in {folder_name}. Skipping.",'level':STATUS_ERROR})
+                            status_queue.put({'type':'status','msg':f"  Permission denied reading file {filename} in {folder_name_raw}. Skipping.",'level':STATUS_ERROR})
                             error_reading_files = True
-                            continue # Skip this file
+                            continue 
 
                         try:
-                            # Read file data
                             with open(full_path, 'rb') as f: data = f.read()
-
-                            # Create file_info dictionary
                             fi=create_file_info();
-                            fi["full_filename"]=filename; # Store original filename
+                            fi["full_filename"]=filename; 
                             base,ext=os.path.splitext(filename)
-
-                            # Encode base filename bytes (truncated to 64)
                             try:fnb=base.encode('ascii')
                             except UnicodeEncodeError:fnb=base.encode('utf-8',errors='ignore')
                             fi["filename_base"]=fnb[:64];
-
-                            # Calculate hash for extension
-                            # Get extension without the dot, handle empty extension case
                             ext_without_dot = ext[1:] if ext and len(ext) > 1 else ""
-                            # Look up in reverse map first (from MHGU file), fallback to calculation
-                            fi["ext_hash"]=REV_EXTENSION_MAP.get(ext.lower(), calculate_arc_hash(ext_without_dot)) # Prioritize map
-
-
-                            fi["data"]=data; # Store actual file data
-                            fi["platform"]=Platform.Switch; # Force Switch for packing
-                            fi["unknown1"]=0; # Default unknown1 for new files (based on typical v9)
-
-                            # Basic validation on file size? Max file size in ARC metadata is int (2GB)
-                            if len(data) > 0x7FFFFFFF: # Approx max signed int size
+                            fi["ext_hash"]=REV_EXTENSION_MAP.get(ext.lower(), calculate_arc_hash(ext_without_dot))
+                            fi["data"]=data; 
+                            fi["platform"]=Platform.Switch; 
+                            fi["unknown1"]=0; 
+                            if len(data) > 0x7FFFFFFF: 
                                  status_queue.put({'type':'status','msg':f"  Warning: File {filename} is very large ({len(data)} bytes), may exceed max size supported by ARC entry metadata.",'level':STATUS_WARN})
-                                 # Continue, but it might fail during packing/struct writing
-
-                            files_to_pack.append(fi) # Add to the list of files to pack
-
+                            files_to_pack.append(fi) 
                         except Exception as e:
-                            # Catch errors during file reading
-                            status_queue.put({'type':'status','msg':f"  Error reading {filename} from {folder_name}:{e}",'level':STATUS_ERROR})
+                            status_queue.put({'type':'status','msg':f"  Error reading {filename} from {folder_name_raw}:{e}",'level':STATUS_ERROR})
                             status_queue.put({'type':'status','msg':f"  Trace: {traceback.format_exc()}",'level':STATUS_DEBUG})
-                            error_reading_files = True # Mark that an error occurred
-
+                            error_reading_files = True 
                     elif entry.is_dir():
-                         status_queue.put({'type':'status','msg':f"  Skipping subdirectory {entry.name} in {folder_name}. Only packing top-level files.",'level':STATUS_WARN})
-                    # else: skip other entry types like symlinks, fifos, etc.
+                         status_queue.put({'type':'status','msg':f"  Skipping subdirectory {entry.name} in {folder_name_raw}. Only packing top-level files.",'level':STATUS_WARN})
 
-                # Catch errors related to entry status/metadata (e.g., broken symlink)
                 except OSError as e:
-                     status_queue.put({'type':'status','msg':f"  Error accessing entry {entry.name} in {folder_name}: {e}. Skipping.",'level':STATUS_ERROR})
-                     error_reading_files = True # Count as an error
+                     status_queue.put({'type':'status','msg':f"  Error accessing entry {entry.name} in {folder_name_raw}: {e}. Skipping.",'level':STATUS_ERROR})
+                     error_reading_files = True 
                 except Exception as e:
-                     # Catch any other unexpected error during entry processing
-                     status_queue.put({'type':'status','msg':f"  An unexpected error accessing {entry.name} in {folder_name}: {e}. Skipping.",'level':STATUS_ERROR});
+                     status_queue.put({'type':'status','msg':f"  An unexpected error accessing {entry.name} in {folder_name_raw}: {e}. Skipping.",'level':STATUS_ERROR});
                      status_queue.put({'type':'status','msg':f"  Trace: {traceback.format_exc()}",'level':STATUS_DEBUG});
                      error_reading_files = True
-
-            # End scandir loop
-
         except (FileNotFoundError, PermissionError) as e:
-             status_queue.put({'type':'status','msg':f"Error accessing input folder {folder_name}: {e}",'level':STATUS_ERROR}); return folder_name,False
+             status_queue.put({'type':'status','msg':f"Error accessing input folder {folder_name_raw}: {e}",'level':STATUS_ERROR}); return folder_name_raw,False
         except Exception as e:
-            # Catch unexpected errors during initial directory scanning
-            status_queue.put({'type':'status','msg':f"An unexpected error occurred scanning folder {folder_name}: {e}",'level':STATUS_ERROR});
+            status_queue.put({'type':'status','msg':f"An unexpected error occurred scanning folder {folder_name_raw}: {e}",'level':STATUS_ERROR});
             status_queue.put({'type':'status','msg':f"Trace: {traceback.format_exc()}",'level':STATUS_DEBUG});
-            return folder_name,False # Signal failure due to scan error
+            return folder_name_raw,False 
 
-
-        # Check results after scanning the folder
-        if not has_files_in_folder: # Folder contained no files (might have only subdirs or be empty)
-            status_queue.put({'type':'status','msg':f"Skipping empty folder: {folder_name}",'level':STATUS_WARN}); return folder_name,False
-        if not files_to_pack: # Folder had entries, but none were successfully read/processed into files_to_pack
-            status_queue.put({'type':'status','msg':f"Skipping folder {folder_name} as no files were successfully read.",'level':STATUS_ERROR}); return folder_name,False
+        if not has_files_in_folder: 
+            status_queue.put({'type':'status','msg':f"Skipping empty folder: {folder_name_raw}",'level':STATUS_WARN}); return folder_name_raw,False
+        if not files_to_pack: 
+            status_queue.put({'type':'status','msg':f"Skipping folder {folder_name_raw} as no files were successfully read.",'level':STATUS_ERROR}); return folder_name_raw,False
         if error_reading_files:
-             status_queue.put({'type': 'status', 'msg': f"Warning: Some files in {folder_name} had read errors and were skipped.", 'level': STATUS_WARN})
+             status_queue.put({'type': 'status', 'msg': f"Warning: Some files in {folder_name_raw} had read errors and were skipped.", 'level': STATUS_WARN})
 
-
-        # Sort files alphabetically by full filename before packing (for consistency)
-        try: files_to_pack.sort(key=lambda fi: fi.get("full_filename", "")) # Use defensive get for key
+        try: files_to_pack.sort(key=lambda fi: fi.get("full_filename", "")) 
         except Exception as e:
-             print(f"Warning: Failed to sort files for folder {folder_name}: {e}", file=sys.stderr)
-             status_queue.put({'type':'status','msg':f"Warning: Failed to sort files for {folder_name}.",'level':STATUS_WARN})
-             # Continue without sorting if sort fails
-
+             print(f"Warning: Failed to sort files for folder {folder_name_raw}: {e}", file=sys.stderr)
+             status_queue.put({'type':'status','msg':f"Warning: Failed to sort files for {folder_name_raw}.",'level':STATUS_WARN})
 
         status_queue.put({'type':'status','msg':f" Rebuilding {output_arc_path.name} ({len(files_to_pack)} files){' (Encrypted)' if key1 and key2 else ''}...",'level':STATUS_INFO})
-        arc = MTArc(); # Create new instance for saving
+        arc = MTArc(); 
 
-        # Ensure output directory exists and is writable before saving
         try: output_rebuilt_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
              raise IOError(f"Failed to create output directory {output_rebuilt_dir}: {e}") from e
 
-        # Check write permission for the specific output file path *or* its parent if it doesn't exist
         if output_arc_path.exists():
             if not os.access(output_arc_path, os.W_OK):
                  raise PermissionError(f"Write permission denied for existing output file: {output_arc_path.name}")
-        # Check parent permission if output file doesn't exist
         elif not output_arc_path.parent.exists():
-            # If parent dir doesn't exist, mkdir should have created it or failed
             raise IOError(f"Output parent directory does not exist: {output_arc_path.parent}")
         elif not os.access(output_arc_path.parent, os.W_OK):
              raise PermissionError(f"Write permission denied for output directory: {output_rebuilt_dir.name}")
+        try:
+            if output_arc_path.resolve().is_relative_to(source_folder_path.resolve()):
+                status_queue.put({'type':'status','msg':f"Error: Output ARC path '{output_arc_path.name}' would be inside the input folder '{folder_name_raw}'. Aborting save.",'level':STATUS_ERROR})
+                return folder_name_raw, False
+        except ValueError: pass 
+        except Exception as e: 
+             status_queue.put({'type':'status','msg':f"Error checking output path safety for {folder_name_raw}: {e}",'level':STATUS_WARN})
+             return folder_name_raw, False
 
-        # Check if the destination is the source folder itself (avoid overwriting input with partial output)
-        if source_folder_path.resolve() == output_arc_path.parent.resolve():
-             # This logic is flawed - output parent is the directory, source is the dir inside.
-             # Need to check if output *file* path is inside source *folder* path.
-             try:
-                 # Use resolve() for both for robust comparison of absolute paths
-                 if output_arc_path.resolve().is_relative_to(source_folder_path.resolve()):
-                    status_queue.put({'type':'status','msg':f"Error: Output ARC path '{output_arc_path.name}' would be inside the input folder '{folder_name}'. Aborting save.",'level':STATUS_ERROR})
-                    return folder_name, False
-             except ValueError: pass # Happens if paths are on different drives/not relative
-
-
-        # Save the ARC file - arc.save handles encryption and writing
-        arc.save(str(output_arc_path), files_to_pack, key1=key1, key2=key2) # Save can raise exceptions
+        arc.save(str(output_arc_path), files_to_pack, key1=key1, key2=key2) 
 
         status_queue.put({'type':'status','msg':f"Successfully rebuilt {output_arc_path.name}",'level':STATUS_SUCCESS})
-        return folder_name, True # Signal success
+        return folder_name_raw, True 
 
     except (FileNotFoundError, PermissionError, IOError, ValueError, RuntimeError) as e:
-         # Catch specific anticipated errors and report them
-         status_queue.put({'type':'status','msg':f"Failed processing folder {folder_name}: {e}",'level':STATUS_ERROR});
-         status_queue.put({'type':'status','msg':f"Trace: {traceback.format_exc()}",'level':STATUS_DEBUG}) # Log traceback for debug info
-         return folder_name,False
+         status_queue.put({'type':'status','msg':f"Failed processing folder {source_folder_path.name}: {e}",'level':STATUS_ERROR});
+         status_queue.put({'type':'status','msg':f"Trace: {traceback.format_exc()}",'level':STATUS_DEBUG}) 
+         return source_folder_path.name,False
     except Exception as e:
-        # Catch any unexpected error during the rest of processing (save)
         status_queue.put({'type': 'status', 'msg': f"An unexpected error occurred processing folder {source_folder_path.name}: {e}", 'level': STATUS_ERROR})
-        status_queue.put({'type':'status','msg':f"Trace: {traceback.format_exc()}",'level':STATUS_DEBUG}) # Log traceback for debug info
-        return source_folder_path.name, False # Signal failure
+        status_queue.put({'type':'status','msg':f"Trace: {traceback.format_exc()}",'level':STATUS_DEBUG}) 
+        return source_folder_path.name, False 
     finally:
-        # Ensure MTArc resources are closed (though currently doesn't hold files open persistently)
         if arc: arc.close()
 
 
 # Orchestrator for single file/folder lists
-def run_batch_parallel(worker_func, item_list, output_dir, progress_callback, status_callback, key1, key2, max_workers=None):
+def run_batch_parallel(worker_func, item_list, output_dir: str | None, progress_callback, status_callback, key1, key2, max_workers=None):
     """Runs a batch of tasks (items) in parallel using a worker function."""
     if not item_list:
         status_callback("No items selected for batch.", STATUS_WARN); progress_callback(100); return
 
-    # Basic validation on output directory before starting threads
-    if not output_dir: # Check if string is empty
-         status_callback("Output directory path is empty.", STATUS_ERROR); progress_callback(0); return
-    output_path = pathlib.Path(output_dir)
-    # Validate output directory exists and is writable
-    try:
-        if output_path.exists(): # Check if directory exists
-            if not output_path.is_dir(): raise NotADirectoryError(f"Output path exists but is not a directory: {output_dir}")
-            if not os.access(output_path, os.W_OK): raise PermissionError(f"Write permission denied for output directory: {output_dir}")
-        else: output_path.mkdir(parents=True, exist_ok=True) # Attempt to create if it doesn't exist
-    except Exception as e:
-         status_callback(f"Output directory error: {e}", STATUS_ERROR); progress_callback(0); return
+    output_path_obj = None # Initialize
+    # For _list_extract_worker, output_dir is ignored by the worker itself.
+    # For other workers (like _list_inject_worker), output_dir is mandatory.
+    if worker_func != _list_extract_worker:
+        if not output_dir:
+             status_callback(f"Output directory path is empty (required for {worker_func.__name__}).", STATUS_ERROR); progress_callback(0); return
+        output_path_obj = pathlib.Path(output_dir)
+        try:
+            if output_path_obj.exists(): 
+                if not output_path_obj.is_dir(): raise NotADirectoryError(f"Output path exists but is not a directory: {output_dir}")
+                if not os.access(output_path_obj, os.W_OK): raise PermissionError(f"Write permission denied for output directory: {output_dir}")
+            else: output_path_obj.mkdir(parents=True, exist_ok=True) 
+        except Exception as e:
+             status_callback(f"Output directory error: {e}", STATUS_ERROR); progress_callback(0); return
+    # else: for _list_extract_worker, output_dir is handled differently (ignored by worker)
 
 
     total_tasks = len(item_list)
     status_callback(f"Starting parallel batch processing for {total_tasks} items...", STATUS_INFO)
-    completed_tasks = 0 # Track completed tasks to update progress
+    start_time = time.perf_counter() 
+    completed_tasks = 0 
 
-    # Determine max workers (default to number of CPU cores or a fixed number if needed)
-    # Using default None lets ThreadPoolExecutor decide based on cores/io
-    # max_workers = max_workers if max_workers is not None else os.cpu_count() or 1
-    # For I/O bound tasks, sometimes more than cores is beneficial, but let's use default for now.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor: 
+        status_queue = queue.Queue() 
+        # Pass output_dir directly (it will be None for _list_extract_worker if called correctly from GUI)
+        futures = [executor.submit(worker_func, str(item), output_dir, key1, key2, status_queue) for item in item_list]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        status_queue = queue.Queue() # Queue for status updates from workers
-        # Submit tasks: worker needs (item_path_str, output_dir_str, k1, k2, queue)
-        # Ensure item is a string path for the worker if it comes from a listbox
-        futures = [executor.submit(worker_func, str(item), str(output_path), key1, key2, status_queue) for item in item_list]
 
-        # Process results as they complete and drain status queue
         for future in concurrent.futures.as_completed(futures):
-            # Process any status messages from the queue first
             while not status_queue.empty():
                 try: msg = status_queue.get_nowait(); status_callback(msg['msg'], msg['level'])
                 except queue.Empty: break
 
             try:
-                # Get result (or exception if worker failed)
                 item_name, success = future.result()
-                # The worker already reported specific success/failure messages for the item
             except Exception as e:
-                # Catch critical errors from worker thread (e.g., unexpected crashes)
                 status_callback(f"Critical error from worker thread processing result: {e}", STATUS_ERROR)
                 status_callback(f"Trace: {traceback.format_exc()}", STATUS_DEBUG)
 
             completed_tasks += 1
-            # Update main progress bar
             progress_callback(completed_tasks / total_tasks * 100)
 
-    # Final status queue drain after all futures are completed
+    end_time = time.perf_counter() 
+    duration = end_time - start_time
+
     while not status_queue.empty():
         try: msg = status_queue.get_nowait(); status_callback(msg['msg'], msg['level'])
         except queue.Empty: break
 
-    status_callback("Batch operation complete.", STATUS_SUCCESS)
+    status_callback(f"Batch operation complete. Time taken: {duration:.2f} seconds.", STATUS_SUCCESS)
 
 
 # --- Recursive Extract Worker and Orchestrator ---
 # (_list_extract_worker is used as the worker for recursive extract)
 
-def recursive_batch_extract(source_root_dir: str, output_base_dir: str, progress_callback: callable, status_callback: callable, key1: str | None, key2: str | None, max_workers=None):
-    """Finds all .arc files recursively and extracts them in parallel."""
+def recursive_batch_extract(source_root_dir: str, output_base_dir: str | None, progress_callback: callable, status_callback: callable, key1: str | None, key2: str | None, max_workers=None):
+    """
+    Finds all .arc files recursively and extracts them in parallel.
+    output_base_dir is ignored as extraction occurs next to source ARC files.
+    """
     status_callback("Scanning for ARC files...", STATUS_INFO)
     source_path = pathlib.Path(source_root_dir)
-    output_path = pathlib.Path(output_base_dir)
+    # output_base_dir is ignored by the worker _list_extract_worker in this context.
 
-    # Input validation
-    if not source_root_dir: status_callback("Input Missing: Please select source directory.", STATUS_ERROR); progress_callback(0); return # Basic GUI-level check duplicated for safety
-    if not output_base_dir: status_callback("Output Missing: Please select output base directory.", STATUS_ERROR); progress_callback(0); return # Basic GUI-level check duplicated for safety
-
+    if not source_root_dir: status_callback("Input Missing: Please select source directory.", STATUS_ERROR); progress_callback(0); return
+    
     if not source_path.is_dir():
          status_callback("Source directory not found or is not a directory.", STATUS_ERROR); progress_callback(0); return
-    # Validate and/or create output directory
-    try:
-        if not output_path.exists(): output_path.mkdir(parents=True, exist_ok=True)
-        elif not output_path.is_dir(): raise NotADirectoryError(f"Output path exists but is not a directory: {output_base_dir}")
-        if not os.access(output_path, os.W_OK): raise PermissionError(f"Write permission denied for output directory: {output_base_dir}")
-        if not os.access(source_path, os.R_OK): raise PermissionError(f"Read permission denied for source directory: {source_root_dir}")
-    except Exception as e:
-        status_callback(f"Directory validation error: {e}", STATUS_ERROR); progress_callback(0); return
+    if not os.access(source_path, os.R_OK): 
+        status_callback(f"Read permission denied for source directory: {source_root_dir}", STATUS_ERROR); progress_callback(0); return
 
-
-    try: arc_files = list(source_path.rglob('*.arc')) # Find all .arc files recursively
+    try: arc_files = list(source_path.rglob('*.arc')) 
     except Exception as e:
          status_callback(f"Error scanning source directory for ARC files: {e}", STATUS_ERROR); progress_callback(0); return
 
@@ -977,38 +919,35 @@ def recursive_batch_extract(source_root_dir: str, output_base_dir: str, progress
 
     total_files = len(arc_files)
     status_callback(f"Found {total_files} ARC files. Starting parallel extraction...", STATUS_INFO)
-    completed_tasks = 0 # Track completed tasks
+    start_time = time.perf_counter() 
+    completed_tasks = 0 
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        status_queue = queue.Queue() # Queue for status updates from workers
-        # Submit tasks: worker needs (arc_path_str, output_base_dir_str, k1, k2, queue)
-        # CORRECTED: Call _list_extract_worker
-        futures = [executor.submit(_list_extract_worker, str(arc_file), str(output_path), key1, key2, status_queue) for arc_file in arc_files]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor: 
+        status_queue = queue.Queue() 
+        # Pass None for output_base_dir_str, as _list_extract_worker will ignore it
+        futures = [executor.submit(_list_extract_worker, str(arc_file), None, key1, key2, status_queue) for arc_file in arc_files]
 
         for future in concurrent.futures.as_completed(futures):
-            # Process any status messages from the queue first
             while not status_queue.empty():
                 try: msg = status_queue.get_nowait(); status_callback(msg['msg'], msg['level'])
                 except queue.Empty: break
-
             try:
-                # Get result (or exception if worker failed)
                 arc_name, success = future.result()
-                # Worker already printed specific success/failure for the file
             except Exception as e:
                 status_callback(f"Critical error from worker thread processing result: {e}", STATUS_ERROR)
                 status_callback(f"Trace: {traceback.format_exc()}", STATUS_DEBUG)
 
             completed_tasks += 1
-            # CORRECTED: Use total_files for calculation
             progress_callback(completed_tasks / total_files * 100)
+    
+    end_time = time.perf_counter() 
+    duration = end_time - start_time
 
-    # Final status queue drain
     while not status_queue.empty():
         try: msg = status_queue.get_nowait(); status_callback(msg['msg'], msg['level'])
         except queue.Empty: break
 
-    status_callback("Recursive batch extraction complete.", STATUS_SUCCESS)
+    status_callback(f"Recursive batch extraction complete. Time taken: {duration:.2f} seconds.", STATUS_SUCCESS)
 
 
 # --- Folder Inject Worker and Orchestrator ---
@@ -1021,7 +960,6 @@ def folder_batch_inject(original_arc_dir: str, edited_content_dir: str, output_r
     edited_path = pathlib.Path(edited_content_dir)
     output_path = pathlib.Path(output_rebuilt_dir)
 
-    # Input validation
     if not original_arc_dir: status_callback("Input Missing: Select Original ARC directory.", STATUS_ERROR); progress_callback(0); return
     if not edited_content_dir: status_callback("Input Missing: Select Edited Content directory.", STATUS_ERROR); progress_callback(0); return
     if not output_rebuilt_dir: status_callback("Output Missing: Select Output directory.", STATUS_ERROR); progress_callback(0); return
@@ -1030,63 +968,85 @@ def folder_batch_inject(original_arc_dir: str, edited_content_dir: str, output_r
     if not edited_path.is_dir(): status_callback("Edited content dir not found.", STATUS_ERROR); progress_callback(0); return
     if not os.access(original_path, os.R_OK): status_callback("Read permission denied for original ARC dir.", STATUS_ERROR); progress_callback(0); return
     if not os.access(edited_path, os.R_OK): status_callback("Read permission denied for edited content dir.", STATUS_ERROR); progress_callback(0); return
-    try: # Validate and/or create output directory
+    try: 
         if output_path.exists():
             if not output_path.is_dir(): raise NotADirectoryError(f"Output path exists but is not a directory: {output_rebuilt_dir}")
             if not os.access(output_path, os.W_OK): raise PermissionError(f"Write permission denied for output directory: {output_rebuilt_dir}")
         else: output_path.mkdir(parents=True, exist_ok=True)
     except Exception as e: status_callback(f"Output directory error: {e}", STATUS_ERROR); progress_callback(0); return
 
-    tasks = [] # List of (edited_folder_path, original_arc_path, output_arc_path) tuples
-    try: # Scan for tasks
-        # Iterate through the edited content directory's top-level items
+    tasks = [] 
+    scan_status_queue = queue.Queue() 
+    def status_callback_local(msg, level): 
+        scan_status_queue.put({'type':'status','msg':msg,'level':level})
+
+    try: 
         for entry in edited_path.iterdir():
             if entry.is_dir():
                 folder_name = entry.name
-                orig_arc = original_path / f"{folder_name}.arc"
-                out_arc = output_path / f"{folder_name}.arc"
+                orig_arc_basename = folder_name
+                if folder_name.endswith("_arc"):
+                     orig_arc_basename = folder_name[:-4]
+
+                orig_arc = original_path / f"{orig_arc_basename}.arc"
+                out_arc = output_path / f"{orig_arc_basename}.arc" 
+
                 if orig_arc.is_file():
                     if os.access(orig_arc, os.R_OK):
-                        # Check for output overwriting input sources
-                        if orig_arc.resolve() == out_arc.resolve(): status_queue.put({'type':'status','msg':f"Skipping '{folder_name}': Output path is same as original ARC.",'level':STATUS_ERROR}); continue
+                        if orig_arc.resolve() == out_arc.resolve():
+                            status_callback_local(f"Skipping '{folder_name}': Output path is same as original ARC.", STATUS_ERROR)
+                            continue
                         try:
-                             # Check if output path is *inside* the input edited folder (avoid overwriting input files)
-                             # Use resolve() for both for robust comparison of absolute paths
                              if out_arc.resolve().is_relative_to(entry.resolve()):
-                                status_queue.put({'type':'status','msg':f"Skipping '{folder_name}': Output ARC path '{out_arc.name}' would be inside the input edited folder '{entry.name}'. Aborting task.",'level':STATUS_ERROR})
-                                continue # Skip this task
-                         # Catch ValueError if paths are on different drives/not relative
-                        except ValueError: pass # No relation, safe
+                                status_callback_local(f"Skipping '{folder_name}': Output ARC path '{out_arc.name}' would be inside the input edited folder '{entry.name}'.", STATUS_ERROR)
+                                continue
+                        except ValueError: pass 
 
                         tasks.append((entry, orig_arc, out_arc))
-                    else: status_queue.put({'type':'status','msg':f"Skipping '{folder_name}': Read permission denied for original ARC '{orig_arc.name}'.", 'level': STATUS_WARN}); continue
-                else: status_queue.put({'type':'status','msg':f"Skipping '{folder_name}': Matching original ARC not found at '{orig_arc.name}'.", 'level': STATUS_WARN}); continue
-            # else: skip files or other entries at the top level of edited_content_dir
-    except Exception as e: status_queue.put( {'type':'status','msg':f"Error scanning directories for tasks: {e}",'level':STATUS_ERROR}); status_queue.put({'type':'status','msg':f"Trace:{traceback.format_exc()}",'level':STATUS_DEBUG}); progress_callback(0); return
+                    else: status_callback_local(f"Skipping '{folder_name}': Read permission denied for original ARC '{orig_arc.name}'.", STATUS_WARN)
+                else: status_callback_local(f"Skipping '{folder_name}': Matching original ARC '{orig_arc.name}' not found.", STATUS_WARN)
+    except Exception as e:
+         status_callback(f"Error scanning directories for tasks: {e}", STATUS_ERROR)
+         status_callback(f"Trace:{traceback.format_exc()}", STATUS_DEBUG)
+         progress_callback(0); return
 
-    if not tasks: status_queue("No matching folders with readable original ARCs found.", STATUS_WARN); progress_callback(100); return
+    while not scan_status_queue.empty():
+        try: msg = scan_status_queue.get_nowait(); status_callback(msg['msg'], msg['level'])
+        except queue.Empty: break
 
-    total_tasks = len(tasks); status_queue(f"Found {total_tasks} folders/ARCs to process. Starting parallel rebuild...", STATUS_INFO);
-    completed_tasks = 0 # Track completed tasks
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        status_queue = queue.Queue()
-        # Submit tasks: worker needs (edited_folder_path_str, output_rebuilt_dir_str, k1, k2, queue)
-        # Pass edited_folder_path_str and output_path_str (as the base for rebuilt ARCs)
-        futures = [executor.submit(_list_inject_worker, str(task[0]), str(output_path), key1, key2, status_queue) for task in tasks]
+    if not tasks:
+        status_callback("No matching folders with readable original ARCs found to process.", STATUS_WARN)
+        progress_callback(100); return
+
+    total_tasks = len(tasks)
+    status_callback(f"Found {total_tasks} folders/ARCs to process. Starting parallel rebuild...", STATUS_INFO);
+    start_time = time.perf_counter() 
+    completed_tasks = 0 
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor: 
+        worker_status_queue = queue.Queue()
+        futures = [executor.submit(_list_inject_worker, str(task[0]), str(output_path), key1, key2, worker_status_queue) for task in tasks]
+
 
         for future in concurrent.futures.as_completed(futures):
-            while not status_queue.empty():
-                try: msg = status_queue.get_nowait(); status_callback(msg['msg'], msg['level'])
+            while not worker_status_queue.empty():
+                try: msg = worker_status_queue.get_nowait(); status_callback(msg['msg'], msg['level'])
                 except queue.Empty: break
-            try: folder_name, success = future.result() # Worker reports success/failure
-            except Exception as e: status_callback(f"Critical error from worker thread result: {e}", STATUS_ERROR); status_callback(f"Trace: {traceback.format_exc()}", STATUS_DEBUG)
+            try:
+                folder_name, success = future.result() 
+            except Exception as e:
+                status_callback(f"Critical error from worker thread result: {e}", STATUS_ERROR)
+                status_callback(f"Trace: {traceback.format_exc()}", STATUS_DEBUG)
             completed_tasks += 1; progress_callback(completed_tasks / total_tasks * 100)
 
-    while not status_queue.empty():
-        try: msg = status_queue.get_nowait(); status_callback(msg['msg'], msg['level'])
+    end_time = time.perf_counter() 
+    duration = end_time - start_time
+
+    while not worker_status_queue.empty():
+        try: msg = worker_status_queue.get_nowait(); status_callback(msg['msg'], msg['level'])
         except queue.Empty: break
-    status_callback("Folder batch injection (rebuild) complete.", STATUS_SUCCESS)
+    status_callback(f"Folder batch injection (rebuild) complete. Time taken: {duration:.2f} seconds.", STATUS_SUCCESS)
 
 
 # --- GUI CODE ---
@@ -1094,87 +1054,61 @@ class ArcToolApp:
     def __init__(self, root):
         self.root = root
         self.root.title("SaladSoftware ARC Tool")
-        # root.geometry("800x700") # Let Tkinter calculate size based on widgets
         self.root.configure(bg=BG_COLOR)
 
-        # --- Fonts ---
         self.default_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE)
         self.bold_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE, weight="bold")
+        self.title_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE + 2, weight="bold")
 
-        # --- Thread-safe Queue ---
-        self.queue = queue.Queue() # Queue for thread-safe updates from workers
-
-        # --- Style Configuration ---
+        self.queue = queue.Queue()
         self.style = ttk.Style()
         self.configure_styles()
 
-        # --- Encryption Key Inputs (Keep at top) ---
-        #key_frame = ttk.Frame(root, style='TFrame'); key_frame.pack(pady=5, padx=10, fill='x')
-        # ttk.Label(key_frame, text="Blowfish Keys (Optional for Encrypted ARCs):", style='Header.TLabel').grid(row=0, column=0, columnspan=4, sticky='w')
-        # ttk.Label(key_frame, text="Key 1:").grid(row=1, column=0, sticky='w', padx=5)
-        #self.key1_var = tk.StringVar(); # Assign StringVar first
-        #key1_entry = ttk.Entry(key_frame, textvariable=self.key1_var, width=30, show='*'); key1_entry.grid(row=1, column=1, sticky='ew', padx=5)
-        #ttk.Label(key_frame, text="Key 2:").grid(row=1, column=2, sticky='w', padx=5)
-        #self.key2_var = tk.StringVar(); # Assign StringVar first
-        # Corrected column assignment
-        #key2_entry = ttk.Entry(key_frame, textvariable=self.key2_var, width=30, show='*'); key2_entry.grid(row=1, column=3, sticky='ew', padx=5)
-        #key_frame.grid_columnconfigure(1, weight=1); key_frame.grid_columnconfigure(3, weight=1)
-
-        # --- Main Structure (4 Tabs) ---
+        key_frame = ttk.Frame(root, style='TFrame'); key_frame.pack(pady=5, padx=10, fill='x')
+        ttk.Label(key_frame, text="~ Handburger's SaladSoftware MT Framework Arc Tool ~", style='TLabel', font=self.title_font, justify= 'center').grid(row=0, column=0, columnspan=4, sticky='w', pady=(0,5))
+        ttk.Label(key_frame, text="Based on Kuriimu/Karameru C# Code by IcySon55", style='TLabel').grid(row=1, column=0, columnspan=4, sticky='w', pady=(0,10))
+        
         self.notebook = ttk.Notebook(root, style='TNotebook')
         self.list_extract_frame = ttk.Frame(self.notebook, style='TFrame')
         self.list_inject_frame = ttk.Frame(self.notebook, style='TFrame')
         self.rec_extract_frame = ttk.Frame(self.notebook, style='TFrame')
         self.folder_inject_frame = ttk.Frame(self.notebook, style='TFrame')
 
-        # Add tabs to the notebook
-        self.notebook.add(self.list_extract_frame, text='Extract Files (List)')
-        self.notebook.add(self.list_inject_frame, text='Inject Folders (List)')
-        self.notebook.add(self.rec_extract_frame, text='Recursive Extract Dir')
-        self.notebook.add(self.folder_inject_frame, text='Folder Inject Dir')
+        self.notebook.add(self.list_extract_frame, text='Extract Arc Files (List)')
+        self.notebook.add(self.list_inject_frame, text='Inject Arc Folders into Arc (List)')
+        self.notebook.add(self.rec_extract_frame, text='Recursive Extract Arcs in Directory')
+        self.notebook.add(self.folder_inject_frame, text='Recursive Inject Folder Directory into Arc')
         self.notebook.pack(pady=5, padx=10, expand=True, fill='both')
 
-        # Populate ALL tabs
         self.create_list_extract_widgets()
         self.create_list_inject_widgets()
         self.create_recursive_extract_widgets()
         self.create_folder_inject_widgets()
 
-        # --- Status Bar & Progress Bar ---
-        # Pack these from the bottom so they stay there
         self.status_frame = ttk.Frame(root, style='Status.TFrame', height=100); self.status_frame.pack(pady=(0, 5), padx=10, fill='x', side=tk.BOTTOM)
         self.status_frame.grid_rowconfigure(0, weight=1); self.status_frame.grid_columnconfigure(0, weight=1)
-        # Increased height for status text
         self.status_text = scrolledtext.ScrolledText(self.status_frame, wrap=tk.WORD, font=self.default_font, bg=WIDGET_BG, fg=TEXT_COLOR, bd=1, relief='sunken', height=8);
         self.status_text.grid(row=0, column=0, sticky='nsew'); self.status_text.configure(state='disabled')
-        # Configure tags for status colors
         self.status_text.tag_config(STATUS_ERROR, foreground=STATUS_ERROR_FG); self.status_text.tag_config(STATUS_WARN, foreground=STATUS_WARN_FG); self.status_text.tag_config(STATUS_SUCCESS, foreground=STATUS_SUCCESS_FG); self.status_text.tag_config(STATUS_INFO, foreground=STATUS_INFO_FG); self.status_text.tag_config(STATUS_DEBUG, foreground=STATUS_DEBUG_FG)
 
-        self.progress_var = tk.DoubleVar(); # Variable for progress bar
+        self.progress_var = tk.DoubleVar(); 
         self.progress_bar = ttk.Progressbar(root, orient='horizontal', length=100, mode='determinate', variable=self.progress_var, style='TProgressbar');
-        self.progress_bar.pack(pady=(0, 10), padx=10, fill='x', side=tk.BOTTOM) # Pack at bottom
+        self.progress_bar.pack(pady=(0, 10), padx=10, fill='x', side=tk.BOTTOM) 
 
-        # Start checking the queue for updates from worker threads
         self.check_queue()
 
     def configure_styles(self):
-        """Configures the ttk styles for the GUI elements."""
-        self.style.theme_use('clam'); # Use 'clam' for better color control
-        # General widget settings
+        self.style.theme_use('clam'); 
         self.style.configure('.',background=BG_COLOR,foreground=TEXT_COLOR,font=self.default_font,fieldbackground=WIDGET_BG,troughcolor=BG_COLOR,borderwidth=1);
         self.style.map('.',foreground=[('disabled','#aaaaaa')]);
-        # Specific widget styles
         self.style.configure('TFrame',background=BG_COLOR);
         self.style.configure('Status.TFrame',background=BG_COLOR);
         self.style.configure('TLabel',background=BG_COLOR,foreground=TEXT_COLOR,padding=5);
         self.style.configure('Header.TLabel',font=self.bold_font,foreground=TEXT_COLOR);
-        # Button styles
         self.style.configure('TButton',background=BUTTON_BG,foreground=BUTTON_FG,bordercolor=BUTTON_BORDER,focuscolor=HIGHLIGHT_BG,lightcolor=BUTTON_BG,darkcolor=BUTTON_BG,padding=6);
         self.style.map('TButton',background=[('active',BUTTON_ACTIVE_BG),('pressed',BUTTON_PRESSED_BG)],foreground=[('active',BUTTON_FG),('pressed',BUTTON_FG)]);
-        # Entry (Input) styles
         self.style.configure('TEntry',fieldbackground=WIDGET_BG,foreground=INPUT_TEXT_COLOR,insertcolor=INPUT_TEXT_COLOR,bordercolor=BUTTON_BORDER);
         self.style.map('TEntry',selectbackground=[('focus',HIGHLIGHT_BG)],selectforeground=[('focus',HIGHLIGHT_TEXT)]);
-        # Listbox styles (using tk.Listbox, style applied via root.option_add)
         self.root.option_add('*Listbox*background',WIDGET_BG);
         self.root.option_add('*Listbox*foreground',TEXT_COLOR);
         self.root.option_add('*Listbox*selectBackground',HIGHLIGHT_BG);
@@ -1182,257 +1116,178 @@ class ArcToolApp:
         self.root.option_add('*Listbox*font',self.default_font);
         self.root.option_add('*Listbox*bd',1);
         self.root.option_add('*Listbox*relief','sunken');
-        # Notebook (Tab) styles
         self.style.configure('TNotebook',background=BG_COLOR,borderwidth=0);
         self.style.configure('TNotebook.Tab',background=HEADER_BG,foreground=HEADER_TEXT,padding=[10,5],font=self.default_font,borderwidth=1);
         self.style.map('TNotebook.Tab',background=[('selected',HEADER_ACTIVE_BG)],foreground=[('selected',HEADER_ACTIVE_TEXT)],expand=[('selected',[1,1,1,1])]);
-        # Progressbar styles
         self.style.configure('TProgressbar',thickness=20,background=STATUS_SUCCESS_FG,troughcolor=WIDGET_BG);
 
 
-    # --- Widget Creation Methods for all 4 tabs ---
     def _create_dir_input(self, parent, label, row, var_name):
-        """Helper to create Label/Entry/Button row for directory input."""
         ttk.Label(parent, text=label, style='Header.TLabel').grid(row=row, column=0, sticky='w', padx=5, pady=(10,2))
         frame=ttk.Frame(parent); frame.grid(row=row+1, column=0, sticky='ew', padx=5, pady=(0,5)); frame.grid_columnconfigure(0, weight=1)
-
-        v=tk.StringVar(); setattr(self, var_name, v); # Create and store the variable
+        v=tk.StringVar(); setattr(self, var_name, v); 
         e=ttk.Entry(frame, textvariable=v, width=60); e.grid(row=0, column=0, sticky='ew')
-        b=ttk.Button(frame, text="Browse...", command=lambda v=v: self._select_directory(v)); b.grid(row=0, column=1, padx=(5,0))
-        return v # Return the variable for convenience
+        b=ttk.Button(frame, text="Browse...", command=lambda v_arg=v: self._select_directory(v_arg)); b.grid(row=0, column=1, padx=(5,0)) # Renamed lambda v to v_arg
+        return v 
 
     def _select_directory(self, string_var):
-        """Callback for Browse directory buttons."""
         directory=filedialog.askdirectory(title="Select Directory")
         if directory: string_var.set(directory)
 
 
     def create_list_extract_widgets(self):
-        """Widgets for the 'Extract Files (List)' tab."""
-        frame=self.list_extract_frame; frame.grid_columnconfigure(0, weight=1); frame.grid_rowconfigure(1, weight=1) # Configure resizing
+        frame=self.list_extract_frame; frame.grid_columnconfigure(0, weight=1); frame.grid_rowconfigure(1, weight=1) 
         ttk.Label(frame, text="Input ARC Files:", style='Header.TLabel').grid(row=0, column=0, columnspan=3, sticky='w', pady=(10,5))
         self.list_extract_listbox=tk.Listbox(frame, width=80, height=10, selectmode=tk.EXTENDED); self.list_extract_listbox.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
         sb=ttk.Scrollbar(frame, orient='vertical', command=self.list_extract_listbox.yview); sb.grid(row=1, column=2, sticky='nsw', pady=5); self.list_extract_listbox.config(yscrollcommand=sb.set)
-        bf=ttk.Frame(frame); bf.grid(row=2, column=0, columnspan=2, sticky='ew') # Button frame
+        bf=ttk.Frame(frame); bf.grid(row=2, column=0, columnspan=2, sticky='ew') 
         ttk.Button(bf, text="Select Files", command=self.select_list_extract_files).pack(side=tk.LEFT, padx=5, pady=5)
         ttk.Button(bf, text="Clear List", command=lambda: self.list_extract_listbox.delete(0, tk.END)).pack(side=tk.RIGHT, padx=5, pady=5)
-        self._create_dir_input(frame, "Output Directory:", 3, "list_extract_output_var")
-        ttk.Button(frame, text="Start Extraction", command=self.start_list_extraction).grid(row=5, column=0, columnspan=3, pady=(20,10))
+        
+        # Output directory explanation label
+        ttk.Label(frame, text="Output: Folders named <filename>_arc will be created next to each input .arc file.", style='TLabel').grid(row=3, column=0, columnspan=3, sticky='w', padx=5, pady=(10,5))
+        
+        ttk.Button(frame, text="Start Extraction", command=self.start_list_extraction).grid(row=4, column=0, columnspan=3, pady=(20,10)) # Adjusted row
 
     def create_list_inject_widgets(self):
-        """Widgets for the 'Inject Folders (List)' tab."""
-        frame=self.list_inject_frame; frame.grid_columnconfigure(0, weight=1); frame.grid_rowconfigure(1, weight=1) # Configure resizing
+        frame=self.list_inject_frame; frame.grid_columnconfigure(0, weight=1); frame.grid_rowconfigure(1, weight=1) 
         ttk.Label(frame, text="Input Source Folders:", style='Header.TLabel').grid(row=0, column=0, columnspan=3, sticky='w', pady=(10,5))
         self.list_inject_listbox=tk.Listbox(frame, width=80, height=10, selectmode=tk.EXTENDED); self.list_inject_listbox.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
         sb=ttk.Scrollbar(frame, orient='vertical', command=self.list_inject_listbox.yview); sb.grid(row=1, column=2, sticky='nsw', pady=5); self.list_inject_listbox.config(yscrollcommand=sb.set)
-        bf=ttk.Frame(frame); bf.grid(row=2, column=0, columnspan=2, sticky='ew') # Button frame
+        bf=ttk.Frame(frame); bf.grid(row=2, column=0, columnspan=2, sticky='ew') 
         ttk.Button(bf, text="Add Folder(s)", command=self.select_list_inject_folders).pack(side=tk.LEFT, padx=5, pady=5)
         ttk.Button(bf, text="Clear List", command=lambda: self.list_inject_listbox.delete(0, tk.END)).pack(side=tk.RIGHT, padx=5, pady=5)
         self._create_dir_input(frame, "Output Rebuilt ARC Directory:", 3, "list_inject_output_var")
         ttk.Button(frame, text="Start Rebuild", command=self.start_list_injection).grid(row=5, column=0, columnspan=3, pady=(20,10))
 
     def create_recursive_extract_widgets(self):
-        """Widgets for the 'Recursive Extract Dir' tab."""
-        frame=self.rec_extract_frame; frame.grid_columnconfigure(0, weight=1); # Configure resizing
+        frame=self.rec_extract_frame; frame.grid_columnconfigure(0, weight=1); 
         self._create_dir_input(frame, "Source ARC Directory (Recursive):", 0, "rec_extract_source_var")
-        self._create_dir_input(frame, "Output Base Directory:", 2, "rec_extract_output_var")
-        ttk.Button(frame, text="Start Recursive Extraction", command=self.start_recursive_extraction).grid(row=4, column=0, pady=(20,10))
+        
+        # Output directory explanation label
+        ttk.Label(frame, text="Output: Folders named <filename>_arc will be created next to each found .arc file.", style='TLabel').grid(row=2, column=0, sticky='w', padx=5, pady=(10,5))
+        
+        ttk.Button(frame, text="Start Recursive Extraction", command=self.start_recursive_extraction).grid(row=3, column=0, pady=(20,10)) # Adjusted row
 
     def create_folder_inject_widgets(self):
-        """Widgets for the 'Folder Inject Dir' tab."""
-        frame=self.folder_inject_frame; frame.grid_columnconfigure(0, weight=1); # Configure resizing
+        frame=self.folder_inject_frame; frame.grid_columnconfigure(0, weight=1); 
         self._create_dir_input(frame, "Original ARC Directory:", 0, "folder_inject_orig_arc_var")
         self._create_dir_input(frame, "Edited Content Directory (Contains Folders):", 2, "folder_inject_edited_dir_var")
         self._create_dir_input(frame, "Output Rebuilt ARC Directory:", 4, "folder_inject_output_var")
         ttk.Button(frame, text="Start Folder Injection", command=self.start_folder_injection).grid(row=6, column=0, pady=(20,10))
 
 
-    # --- File/Folder Selection Logic ---
     def select_list_extract_files(self):
-        """Opens file dialog to select multiple .arc files and adds them to the listbox."""
         files=filedialog.askopenfilenames(title="Select ARC Files", filetypes=[("MT ARC","*.arc"),("All Files","*.*")])
         if files:
-            # Add files only if they are not already in the listbox
             current_items = set(self.list_extract_listbox.get(0, tk.END))
             for f in files:
                 if f not in current_items:
                     self.list_extract_listbox.insert(tk.END, f)
 
     def select_list_inject_folders(self):
-        """Opens directory dialog to select a folder and adds it to the listbox."""
         directory=filedialog.askdirectory(title="Select Source Folder")
         if directory:
-            # Add directory only if not already in the listbox
             current_items = set(self.list_inject_listbox.get(0, tk.END))
             if directory not in current_items:
                  self.list_inject_listbox.insert(tk.END, directory)
 
 
-    # --- Action Starters (Call _run_task) ---
-    def _get_keys(self):
-        """Gets encryption keys from GUI input fields. Returns (key1, key2) or (None, None). Shows warning if only one key is entered."""
-        k1=self.key1_var.get();k2=self.key2_var.get()
-        if k1 and k2: return k1,k2
-        elif k1 or k2:
-             # Only one key provided, invalid state for MTF
-             messagebox.showwarning("Key Incomplete","Please enter both Key 1 and Key 2, or leave both blank for no encryption.")
-             return None, None # Indicate invalid state (handled by caller checking return value)
-        else: return None, None # No keys provided, valid state for unencrypted
-
-
     def _run_task(self, target_func, args_tuple):
-        """Starts a batch task in a separate thread after checking keys and inputs."""
-        # Get keys from GUI, handles validation check internally
-        k1, k2 = self._get_keys()
-        # If _get_keys returned (None, None) because only one key was entered, abort.
-        # It will show a warning, no need to re-check type here.
-        if k1 is None and k2 is None and (self.key1_var.get() or self.key2_var.get()):
-             return # Abort if key state is invalid (user was warned)
-
-        # Pass keys, progress callback, status queue down to the batch function
+        k1, k2 = None, None 
         full_args = args_tuple + (self.update_progress, self.queue_status, k1, k2)
-
-        # Reset progress bar
         self.progress_var.set(0)
-
-        # Use a more specific message based on the target function name
         task_name = target_func.__name__.replace('_batch', '').replace('_list', ' List').replace('_recursive', ' Recursive').replace('_folder', ' Folder').replace('_', ' ').strip().title()
         self.add_status_message(f"Starting {task_name} task...", STATUS_INFO)
-
-        # Run the batch function in a thread
-        thread = threading.Thread(target=target_func, args=full_args, daemon=True) # daemon=True allows app to exit if thread is still running
+        thread = threading.Thread(target=target_func, args=full_args, daemon=True) 
         thread.start()
 
 
     def start_list_extraction(self):
-        """Initiates extraction of selected files using the parallel list runner."""
         items = self.list_extract_listbox.get(0, tk.END)
-        out_dir = self.list_extract_output_var.get()
-
-        # Input validation (basic checks, more robust checks handled in run_batch_parallel worker validation)
+        # out_dir is no longer taken from GUI for this operation
         if not items: messagebox.showwarning("Input Missing","Please select one or more ARC files to extract."); return
-        if not out_dir: messagebox.showwarning("Output Missing","Please select an output directory."); return
-
-        # Call the generic parallel runner with the list worker
-        self._run_task(run_batch_parallel, (_list_extract_worker, items, out_dir))
+        # Pass None for out_dir, as _list_extract_worker will place output next to source
+        self._run_task(run_batch_parallel, (_list_extract_worker, items, None))
 
 
     def start_list_injection(self):
-        """Initiates injection (rebuild) of selected folders using the parallel list runner."""
         items = self.list_inject_listbox.get(0, tk.END)
-        out_dir = self.list_inject_output_var.get()
-
-        # Input validation (basic checks, more robust checks handled in run_batch_parallel worker validation)
+        out_dir = self.list_inject_output_var.get() 
         if not items: messagebox.showwarning("Input Missing","Please add one or more source folders to inject."); return
         if not out_dir: messagebox.showwarning("Output Missing","Please select an output directory."); return
-        # Validate source folders exist client-side before starting thread (better user feedback)
         for folder_path in items:
             if not os.path.isdir(folder_path): messagebox.showerror("Input Invalid",f"Source folder not found: {folder_path}"); return
-
-        # Call the generic parallel runner with the list worker and the list of items
         self._run_task(run_batch_parallel, (_list_inject_worker, items, out_dir))
 
 
     def start_recursive_extraction(self):
-        """Initiates recursive extraction from a source directory."""
         src = self.rec_extract_source_var.get()
-        out = self.rec_extract_output_var.get()
-
-        # Input validation (basic checks, more robust checks handled in recursive_batch_extract)
+        # out (output_base_dir) is no longer taken from GUI for this operation
         if not src: messagebox.showwarning("Input Missing","Please select the source directory containing ARC files."); return
-        if not out: messagebox.showwarning("Output Missing","Please select the output base directory."); return
-
-        # Call the recursive batch function directly (it handles finding files)
-        self._run_task(recursive_batch_extract, (src, out))
+        # Pass None for out_dir, as _list_extract_worker will place output next to source
+        self._run_task(recursive_batch_extract, (src, None))
 
 
     def start_folder_injection(self):
-        """Initiates folder injection (rebuild) using original and edited directories."""
         orig = self.folder_inject_orig_arc_var.get()
         edit = self.folder_inject_edited_dir_var.get()
         out = self.folder_inject_output_var.get()
-
-        # Input validation (basic checks, more robust checks handled in folder_batch_inject)
         if not orig: messagebox.showwarning("Input Missing","Please select the directory containing original ARC files."); return
         if not edit: messagebox.showwarning("Input Missing","Please select the directory containing edited content folders."); return
         if not out: messagebox.showwarning("Output Missing","Please select the output directory for rebuilt ARCs."); return
-
-        # Call the folder batch function directly (it handles scanning folders)
         self._run_task(folder_batch_inject, (orig, edit, out))
 
 
-    # --- Queue/Status/Progress Handling ---
     def update_progress(self,v):
-        """Updates the GUI progress bar (called from worker threads via queue)."""
-        # Ensure value is within bounds 0-100 before setting
-        self.queue.put({'type':'progress','value':max(0.0, min(100.0, float(v)))}) # Ensure float
+        self.queue.put({'type':'progress','value':max(0.0, min(100.0, float(v)))}) 
 
     def queue_status(self,m,l=STATUS_INFO):
-        """Adds a status message to the queue (called from worker threads)."""
         self.queue.put({'type':'status','msg':m,'level':l})
 
     def check_queue(self):
-        """Processes messages from the queue and updates the GUI."""
         try:
             while True:
-                # Get message without blocking
                 m=self.queue.get_nowait()
                 t=m.get('type')
                 if t=='progress':
-                    # Set the progress bar value
                     self.progress_var.set(m.get('value',0.0))
                 elif t=='status':
-                    # Add status message to the text widget
                     self.add_status_message(m.get('msg',''),m.get('level',STATUS_INFO))
-                # else: ignore unknown message types
-
         except queue.Empty:
-            # No messages currently in the queue
             pass
         except Exception as e:
-            # Catch unexpected errors during queue processing in the main thread
             print(f"Critical error processing queue: {e}", file=sys.stderr)
             print(f"Trace: {traceback.format_exc()}", file=sys.stderr)
-            # Attempt to add a message to the status window if possible
             try: self.add_status_message(f"Critical GUI queue error: {e}", STATUS_ERROR)
-            except Exception: pass # Give up if status update itself fails
-
+            except Exception: pass 
         finally:
-            # Schedule the next check
-            self.root.after(100,self.check_queue) # Check queue every 100ms
+            self.root.after(100,self.check_queue) 
 
     def add_status_message(self,m,l=STATUS_INFO):
-        """Appends a message to the status text widget with formatting (called from main thread)."""
         try:
-            self.status_text.configure(state='normal') # Enable editing
-            # Add a timestamp for clarity in logs
+            self.status_text.configure(state='normal') 
             timestamp = datetime.now().strftime("[%H:%M:%S]")
-            self.status_text.insert(tk.END,f"{timestamp} {m}\n",l) # Insert text with tag (level)
-            self.status_text.configure(state='disabled') # Disable editing
-            self.status_text.see(tk.END) # Scroll to the end
+            self.status_text.insert(tk.END,f"{timestamp} {m}\n",l) 
+            self.status_text.configure(state='disabled') 
+            self.status_text.see(tk.END) 
         except Exception as e:
-            # Fallback print if GUI update fails
             print(f"Error updating status GUI: {e}", file=sys.stderr)
             print(f"Status message: {m}", file=sys.stderr)
-            # Traceback is already logged by the worker or higher level error handlers
 
 
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
-    # Check for pycryptodome dependency before starting GUI
     try: from Crypto.Cipher import Blowfish
     except ImportError:
         messagebox.showerror("Dependency Missing","Required library 'pycryptodome' not found.\nPlease install it using:\npip install pycryptodome")
-        sys.exit(1) # Exit immediately if dependency is not met
+        sys.exit(1) 
 
-    # Optional: Add basic CLI argument parsing for headless mode or specifying defaults? (Out of scope for now)
-
-    # Load the extension map from the specified file
-    extension_map_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), EXTENSION_MAP_FILE)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    extension_map_file_path = os.path.join(script_dir, EXTENSION_MAP_FILE)
     load_extension_map(extension_map_file_path)
-    if not EXTENSION_MAP: # If map failed to load or is empty
-         messagebox.showwarning("Extension Map", f"Could not load or parse '{EXTENSION_MAP_FILE}'.\nFile extensions will be derived from hashes only.")
-
+    if not EXTENSION_MAP: 
+         messagebox.showwarning("Extension Map", f"Could not load or parse '{EXTENSION_MAP_FILE}' from '{extension_map_file_path}'.\nFile extensions will be derived from hashes only.")
 
     root = tk.Tk()
     app = ArcToolApp(root)
