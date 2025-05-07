@@ -164,8 +164,11 @@ Start Folder Injection: Begins the matching and rebuilding process.
 #### Extracting a Single ARC
 
 > Go to the "Extract Arc Files (List)" tab.
+> 
 > Click "Select Files" and choose the MHGU .arc file (e.g., common/data/font/font_EU.arc).
+>
 > The file path will appear in the listbox.
+>
 > Click "Start Extraction".
 
 A new folder (e.g., font_EU_arc) will be created in the same directory as font_EU.arc, containing its extracted contents.
@@ -219,11 +222,11 @@ The tool will rebuild em001_00.arc and wp00_blk.arc into the Rebuilt_ARCs folder
 
 File Paths: MHGU is sensitive to file paths within ARCs. Do not rename or move files within an extracted _arc folder unless you know exactly what you are doing. The tool rebuilds ARCs using the filenames and (lack of) subfolder structure found within the source _arc folder.
 
-Extension Map is Key: Without a good extension_index_line.txt, many files will have generic .XXXXXXXX (hex hash) extensions, making them hard to identify and edit.
+* Extension Map is Key: Without a good extension_index_line.txt, many files will have generic .XXXXXXXX (hex hash) extensions, making them hard to identify and edit.
 
-Backup Your Files: Always back up your original game files and save data before installing any mods.
+* Backup Your Files: Always back up your original game files and save data before installing any mods.
 
-Test Thoroughly: After rebuilding and installing modded ARCs, test the game thoroughly to ensure stability and that your changes work as expected.
+* Test Thoroughly: After rebuilding and installing modded ARCs, test the game thoroughly to ensure stability and that your changes work as expected.
 
 #### Troubleshooting
 
@@ -253,8 +256,3 @@ IcySon55 (Kuriimu/Karameru): Original C# code and MT Framework ARC logic.
 *   **Workflow Examples:** Tailored to reflect the new extraction output behavior and common MHGU modding scenarios.
 
 Remember to replace placeholders like `C:\MHGU_DUMP\` with paths relevant to a typical user's setup if you have better examples. You can also add screenshots to the wiki page by uploading images to the GitHub wiki repository and linking them using Markdown's image syntax: `![Alt text](link_to_image.png)`.
-IGNORE_WHEN_COPYING_START
-content_copy
-download
-Use code with caution.
-IGNORE_WHEN_COPYING_END
