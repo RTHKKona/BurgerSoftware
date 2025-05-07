@@ -104,8 +104,6 @@ Clear List: Removes all files from the listbox.
 
 Output:
 
-A label indicates: "Output: Folders named <filename>_arc will be created next to each input .arc file."
-
 Start Extraction: Begins the extraction process for all listed ARC files.
 
 2. Inject Arc Folders into Arc (List)
@@ -135,9 +133,6 @@ Source ARC Directory (Recursive):
 Browse...: Select the main directory containing the MHGU .arc files you wish to extract. The tool will scan this directory and all its subfolders for .arc files.
 
 Output:
-
-A label indicates: "Output: Folders named <filename>_arc will be created next to each found .arc file."
-
 Start Recursive Extraction: Begins scanning and extracting all found .arc files.
 
 4. Folder Inject Directory
@@ -220,25 +215,11 @@ The tool will rebuild em001_00.arc and wp00_blk.arc into the Rebuilt_ARCs folder
 
 #### Important Notes for MHGU Modding
 
-File Paths: MHGU is sensitive to file paths within ARCs. Do not rename or move files within an extracted _arc folder unless you know exactly what you are doing. The tool rebuilds ARCs using the filenames and (lack of) subfolder structure found within the source _arc folder.
-
-* Extension Map is Key: Without a good extension_index_line.txt, many files will have generic .XXXXXXXX (hex hash) extensions, making them hard to identify and edit.
-
 * Backup Your Files: Always back up your original game files and save data before installing any mods.
-
-* Test Thoroughly: After rebuilding and installing modded ARCs, test the game thoroughly to ensure stability and that your changes work as expected.
 
 #### Troubleshooting
 
 "Dependency Missing: pycryptodome": Ensure you have installed pycryptodome via pip (see Setup).
-
-"Extension Map: Could not load or parse...": Make sure extension_index_line.txt is in the same directory as the script and is correctly formatted.
-
-Permission Denied Errors: Ensure the tool has read permissions for input files/folders and write permissions for output locations. Try running as administrator if issues persist (though generally not recommended unless necessary).
-
-Slow Performance on Many Small Files: Batch operations on a very large number of ARCs containing many small files can still take time, even with parallel processing. This is normal.
-
-Extraction/Rebuild Errors for Specific Files: Check the status log for details. The error might be due to a corrupted ARC, an issue with a specific file being processed (e.g., unsupported compression if it wasn't standard Zlib, though unlikely for MHGU), or an unexpected file structure.
 
 #### Credits
 
