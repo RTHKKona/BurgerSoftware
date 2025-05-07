@@ -1,3 +1,5 @@
+![salad-stock-image-3862675171 (1)](https://github.com/user-attachments/assets/feea76d4-ca61-4d1c-af68-d0188ab1b54a)
+
 # SaladSoftware MHGU ARC Tool
 
 Welcome to the SaladSoftware MHGU ARC Tool wiki! This tool is designed for extracting and rebuilding `.arc` archive files specifically for Monster Hunter Generations Ultimate (MHGU) on the Nintendo Switch.
