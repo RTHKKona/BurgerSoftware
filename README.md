@@ -60,16 +60,10 @@ download
 Use code with caution.
 IGNORE_WHEN_COPYING_END
 
-Example:
+Examples:
 
 05F3328D, .gmd
 EF4D6A77, .tex
-# Lines starting with # or // are comments and will be ignored.
-IGNORE_WHEN_COPYING_START
-content_copy
-download
-Use code with caution.
-IGNORE_WHEN_COPYING_END
 
 A comprehensive extension_index_line.txt specific to MHGU is highly recommended for proper file identification.
 
