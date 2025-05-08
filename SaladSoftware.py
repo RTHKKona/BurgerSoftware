@@ -23,6 +23,7 @@ from Crypto.Cipher import Blowfish
 # from Crypto.Util.Padding import pad, unpad # Using manual null padding
 # from Crypto.Random import get_random_bytes # Not currently needed
 from datetime import datetime # For timestamps
+import shutil # For moving files/folders
 
 
 # --- CONSTANTS ---
@@ -57,7 +58,7 @@ MAX_WORKERS = min(MAX_WORKERS, 32)
 # --- Extension Map (Will be populated from file) ---
 EXTENSION_MAP = {}
 REV_EXTENSION_MAP = {}
-EXTENSION_MAP_FILE = "extension_index_line.txt" # Name of the file to load
+EXTENSION_MAP_FILE = "unique_extensions.txt" # Default to user-provided file
 
 
 # --- ARC UTILITIES & MTArc Class ---
@@ -76,7 +77,10 @@ def create_file_info():
     }
 
 def load_extension_map(filepath: str):
-    """Loads the extension map from a text file."""
+    """
+    Loads the extension map from a text file (like unique_extensions.txt).
+    Each line is either an 8-char hex hash or a plaintext extension string (without dot).
+    """
     global EXTENSION_MAP, REV_EXTENSION_MAP
     EXTENSION_MAP = {}
     REV_EXTENSION_MAP = {}
@@ -85,43 +89,70 @@ def load_extension_map(filepath: str):
         print(f"Warning: Extension map file not found at '{filepath}'. Using empty map.", file=sys.stderr)
         return
 
+    potential_hashes_from_file = set()
+    potential_extension_strings = []
+
     try:
-        with open(filepath, 'r', encoding='utf-8') as f: # Use utf-8 encoding for safety
+        with open(filepath, 'r', encoding='utf-8') as f:
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
-                if not line or line.startswith('#') or line.startswith('//'): continue # Skip empty lines and comments
+                if not line or line.startswith('#') or line.startswith('//'):
+                    continue
 
-                try:
-                    parts = line.split(',', 1) # Split only on the first comma
-                    if len(parts) == 2:
-                        hex_hash_str = parts[0].strip()
-                        extension_str = parts[1].strip()
+                is_potential_hash = False
+                if len(line) == 8:
+                    try:
+                        hash_val = int(line, 16) # Check if it's a valid hex
+                        # No explicit range check needed due to Python's arbitrary int size,
+                        # but struct.pack would fail later for out-of-range ULONG.
+                        # For now, accept any 8-char hex as a potential hash.
+                        potential_hashes_from_file.add(hash_val)
+                        is_potential_hash = True
+                    except ValueError:
+                        pass # Not a valid 8-char hex, treat as potential extension string
 
-                        # Parse hex hash
-                        hash_value = int(hex_hash_str, 16)
-
-                        # Validate extension string format (starts with dot)
-                        if extension_str.startswith('.'):
-                             # Add to maps
-                             EXTENSION_MAP[hash_value] = extension_str
-                             # Store lowercase extension in reverse map
-                             REV_EXTENSION_MAP[extension_str.lower()] = hash_value
-                        else:
-                            print(f"Warning: Line {line_num} in {filepath}: Invalid extension format '{extension_str}'. Skipping.", file=sys.stderr)
-
+                if not is_potential_hash:
+                    # Treat as a plaintext extension string (e.g., "tex", "arc", "w00d")
+                    # Basic validation: common extension characters
+                    # Allow alphanum, underscore. Add more if needed, but keep it simple.
+                    if line and all(c.isalnum() or c == '_' for c in line):
+                         potential_extension_strings.append(line)
                     else:
-                        print(f"Warning: Line {line_num} in {filepath}: Invalid format (expected 'hash, .ext'). Skipping.", file=sys.stderr)
+                        # Check if it's a multi-part extension like "main.dfa" but without the leading dot
+                        # This case is less likely for unique_extensions.txt format
+                        # For now, we assume simple extension strings if not hashes
+                        print(f"Warning: Line {line_num} in {filepath}: Skipping unusual string '{line}' (neither 8-char hex nor simple extension).", file=sys.stderr)
+        
+        # Process plaintext extension strings first
+        for ext_str_no_dot in potential_extension_strings:
+            actual_ext_with_dot = "." + ext_str_no_dot # e.g., ".tex"
+            hash_for_ext = calculate_arc_hash(ext_str_no_dot) # e.g., calculate_arc_hash("tex")
 
-                except ValueError:
-                    print(f"Warning: Line {line_num} in {filepath}: Invalid hex hash value ('{hex_hash_str}'). Skipping.", file=sys.stderr)
-                except Exception as e:
-                    print(f"Warning: Unexpected error processing line {line_num} in {filepath}: {e}. Skipping.", file=sys.stderr)
+            # If this hash is already mapped, prefer the existing one if different, or just ensure consistency.
+            # For simplicity, new entries will overwrite, assuming the list is curated.
+            EXTENSION_MAP[hash_for_ext] = actual_ext_with_dot
+            REV_EXTENSION_MAP[actual_ext_with_dot.lower()] = hash_for_ext
+            
+            # If this calculated hash was also listed explicitly as a hex hash,
+            # it means it's "explained" by a plaintext string.
+            if hash_for_ext in potential_hashes_from_file:
+                potential_hashes_from_file.remove(hash_for_ext)
 
-        print(f"Loaded {len(EXTENSION_MAP)} extension mappings from {filepath}.")
+        # Any hashes remaining in potential_hashes_from_file are those listed as hex
+        # but for which no plaintext extension string in the file calculated to that hash.
+        # These will be handled by get_full_filename's fallback (e.g. ".1234ABCD").
+        # No explicit add to EXTENSION_MAP for these is strictly needed for functionality,
+        # as get_full_filename handles hashes not in EXTENSION_MAP by formatting them.
+
+        num_mapped = len(EXTENSION_MAP)
+        num_unexplained_hashes = len(potential_hashes_from_file)
+        print(f"Loaded {num_mapped} extension mappings from {filepath}. "
+              f"({num_unexplained_hashes} additional 8-char hex strings were found but not mapped to a plaintext extension in the file).")
 
     except Exception as e:
         print(f"Error loading extension map from {filepath}: {e}", file=sys.stderr)
-        EXTENSION_MAP = {} # Ensure maps are empty on error
+        traceback.print_exc() # More detail for debugging map loading
+        EXTENSION_MAP = {} 
         REV_EXTENSION_MAP = {}
 
 
@@ -566,16 +597,28 @@ class MTArc:
                 with open(output_p,'wb')as f:
                     f.write(b'\x00'*self.header_length);mdb_plain=bytearray();packed_entry_count=0
                     for fi in updated_file_infos:
-                        fnb=fi.get("filename_base");fn=fi.get("full_filename","?")
-                        if not fnb:bn=os.path.splitext(fn)[0];
-                        try:fnb=bn.encode('ascii')
-                        except UnicodeEncodeError:fnb=bn.encode('utf-8',errors='ignore')
-                        filename_bytes=fnb
-                        pn=filename_bytes[:64].ljust(64,b'\x00')
-                        ev=(pn,fi.get("ext_hash",0),fi.get("compressed_size",0),fi.get("uncompressed_size_raw",0),fi.get("unknown1",0),fi.get("offset",0))
-                        if ev[2]is None or not isinstance(ev[2],int)or ev[2]<0 or ev[5]is None or not isinstance(ev[5],int)or ev[5]<0:print(f"W:Skip pack entry '{fn}':Invalid size({ev[2]})or offset({ev[5]}).",file=sys.stderr);continue
+                        packed_name_bytes = fi.get("filename_base") 
+                        fn_display = fi.get("full_filename","?") 
+
+                        if not isinstance(packed_name_bytes, bytes) or len(packed_name_bytes) != 64:
+                            print(f"W: filename_base for '{fn_display}' not pre-formatted or missing. Re-deriving from full_filename.", file=sys.stderr)
+                            base_name_for_arc_str = os.path.splitext(fn_display)[0]
+                            try: 
+                                fnb_enc = base_name_for_arc_str.encode('ascii')
+                            except UnicodeEncodeError: 
+                                fnb_enc = base_name_for_arc_str.encode('utf-8', errors='ignore')
+                            packed_name_bytes = fnb_enc[:64].ljust(64, b'\x00')
+                        
+                        ev=(packed_name_bytes, 
+                            fi.get("ext_hash",0),
+                            fi.get("compressed_size",0),
+                            fi.get("uncompressed_size_raw",0),
+                            fi.get("unknown1",0),
+                            fi.get("offset",0))
+                        
+                        if ev[2]is None or not isinstance(ev[2],int)or ev[2]<0 or ev[5]is None or not isinstance(ev[5],int)or ev[5]<0:print(f"W:Skip pack entry '{fn_display}':Invalid size({ev[2]})or offset({ev[5]}).",file=sys.stderr);continue
                         try:packed_entry=struct.pack(self.entry_struct_fmt,*ev);mdb_plain.extend(packed_entry);packed_entry_count+=1
-                        except Exception as e:print(f"ERR:Pack entry fail '{fn}':{e}.Skip.",file=sys.stderr)
+                        except Exception as e:print(f"ERR:Pack entry fail '{fn_display}':{e}.Skip.",file=sys.stderr)
                     mdr=bytes(mdb_plain);mtw=mdr;
                     if self.is_encrypted:
                         if not self.crypto:raise RuntimeError("Encrypt but no crypto");
@@ -701,15 +744,17 @@ def _list_extract_worker(arc_path_str: str, output_base_dir_str: str | None, key
 
 
 # Worker for single folder based injection
-# _list_inject_worker(source_folder_str, output_rebuilt_dir_str, key1, key2, status_queue)
+# _list_inject_worker(source_folder_str, output_rebuilt_dir_str, key1, key2, status_queue, target_arc_filename_override=None)
 # Also used for Folder Inject Dir
-def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str | None, key1: str | None, key2: str | None, status_queue: queue.Queue):
-    """Worker to rebuild a single ARC from a source folder."""
+def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str | None, 
+                        key1: str | None, key2: str | None, status_queue: queue.Queue,
+                        target_arc_filename_override: str | None = None):
+    """Worker to rebuild a single ARC from a source folder (scans recursively)."""
     source_folder_path = pathlib.Path(source_folder_str)
-    # output_rebuilt_dir_str is required for injection.
+    
     if not output_rebuilt_dir_str:
         status_queue.put({'type':'status','msg':f"Output directory for rebuild not provided for {source_folder_path.name}.", 'level':STATUS_ERROR})
-        return source_folder_path.name, False
+        return source_folder_path.name, False 
     output_rebuilt_dir = pathlib.Path(output_rebuilt_dir_str)
     arc = None 
 
@@ -719,7 +764,11 @@ def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str | No
         if folder_name_raw.endswith("_arc"):
             arc_base_name = folder_name_raw[:-4]
 
-        output_arc_path = output_rebuilt_dir / f"{arc_base_name}.arc"
+        if target_arc_filename_override:
+            output_arc_path = output_rebuilt_dir / target_arc_filename_override
+        else:
+            output_arc_path = output_rebuilt_dir / f"{arc_base_name}.arc"
+
 
         status_queue.put({'type': 'status', 'msg': f"Processing folder {folder_name_raw} for rebuild as {output_arc_path.name}...", 'level': STATUS_DEBUG})
 
@@ -733,61 +782,91 @@ def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str | No
             if not os.access(source_folder_path, os.R_OK):
                  raise PermissionError(f"Read permission denied for folder: {source_folder_path.name}")
 
-            for entry in os.scandir(source_folder_path):
-                try:
-                    if entry.is_file():
-                        has_files_in_folder = True
-                        filename = entry.name; full_path = entry.path
-                        if not os.access(full_path, os.R_OK):
-                            status_queue.put({'type':'status','msg':f"  Permission denied reading file {filename} in {folder_name_raw}. Skipping.",'level':STATUS_ERROR})
-                            error_reading_files = True
-                            continue 
+            for root_str, _, files_in_dir in os.walk(source_folder_path):
+                root_path = pathlib.Path(root_str)
+                for filename_leaf in files_in_dir:
+                    has_files_in_folder = True 
+                    file_path_obj = root_path / filename_leaf
+                    
+                    if not os.access(str(file_path_obj), os.R_OK):
+                        status_queue.put({'type':'status','msg':f"  Permission denied reading file {file_path_obj.relative_to(source_folder_path)} in {folder_name_raw}. Skipping.",'level':STATUS_ERROR})
+                        error_reading_files = True
+                        continue
+                    
+                    try:
+                        with open(file_path_obj, 'rb') as f: data = f.read()
+                        
+                        fi = create_file_info()
+                        
+                        relative_arc_path = file_path_obj.relative_to(source_folder_path)
+                        arc_internal_filename = relative_arc_path.as_posix() # Use forward slashes
 
+                        fi["full_filename"] = arc_internal_filename 
+
+                        base_for_arc, ext_for_arc_with_dot = os.path.splitext(arc_internal_filename) # ext_for_arc_with_dot e.g. ".tex" or ".ABCD1234"
+                        
                         try:
-                            with open(full_path, 'rb') as f: data = f.read()
-                            fi=create_file_info();
-                            fi["full_filename"]=filename; 
-                            base,ext=os.path.splitext(filename)
-                            try:fnb=base.encode('ascii')
-                            except UnicodeEncodeError:fnb=base.encode('utf-8',errors='ignore')
-                            fi["filename_base"]=fnb[:64];
-                            ext_without_dot = ext[1:] if ext and len(ext) > 1 else ""
-                            fi["ext_hash"]=REV_EXTENSION_MAP.get(ext.lower(), calculate_arc_hash(ext_without_dot))
-                            fi["data"]=data; 
-                            fi["platform"]=Platform.Switch; 
-                            fi["unknown1"]=0; 
-                            if len(data) > 0x7FFFFFFF: 
-                                 status_queue.put({'type':'status','msg':f"  Warning: File {filename} is very large ({len(data)} bytes), may exceed max size supported by ARC entry metadata.",'level':STATUS_WARN})
-                            files_to_pack.append(fi) 
-                        except Exception as e:
-                            status_queue.put({'type':'status','msg':f"  Error reading {filename} from {folder_name_raw}:{e}",'level':STATUS_ERROR})
-                            status_queue.put({'type':'status','msg':f"  Trace: {traceback.format_exc()}",'level':STATUS_DEBUG})
-                            error_reading_files = True 
-                    elif entry.is_dir():
-                         status_queue.put({'type':'status','msg':f"  Skipping subdirectory {entry.name} in {folder_name_raw}. Only packing top-level files.",'level':STATUS_WARN})
+                            fnb_encoded_str = base_for_arc.encode('ascii')
+                        except UnicodeEncodeError:
+                            fnb_encoded_str = base_for_arc.encode('utf-8', errors='ignore')
+                        
+                        fi["filename_base"] = fnb_encoded_str[:64].ljust(64,b'\x00')
 
-                except OSError as e:
-                     status_queue.put({'type':'status','msg':f"  Error accessing entry {entry.name} in {folder_name_raw}: {e}. Skipping.",'level':STATUS_ERROR})
-                     error_reading_files = True 
-                except Exception as e:
-                     status_queue.put({'type':'status','msg':f"  An unexpected error accessing {entry.name} in {folder_name_raw}: {e}. Skipping.",'level':STATUS_ERROR});
-                     status_queue.put({'type':'status','msg':f"  Trace: {traceback.format_exc()}",'level':STATUS_DEBUG});
-                     error_reading_files = True
+                        # --- Determine ext_hash ---
+                        assigned_hash = None
+                        # 1. Try REV_EXTENSION_MAP (for friendly extensions like .tex -> hash)
+                        if ext_for_arc_with_dot.lower() in REV_EXTENSION_MAP:
+                            assigned_hash = REV_EXTENSION_MAP[ext_for_arc_with_dot.lower()]
+                        else:
+                            # 2. Check if the extension string (without dot) is an 8-char hex hash
+                            potential_hash_str_from_ext = ext_for_arc_with_dot[1:] # Remove leading dot
+                            if len(potential_hash_str_from_ext) == 8:
+                                try:
+                                    assigned_hash = int(potential_hash_str_from_ext, 16)
+                                except ValueError:
+                                    pass # Not a valid hex string, will fall through
+
+                            if assigned_hash is None:
+                                # 3. Fallback: calculate hash of the extension string itself (e.g. "foo" for ".foo", or "ABCD1234" if it wasn't valid hex)
+                                # For calculate_arc_hash, we pass the string without the dot.
+                                assigned_hash = calculate_arc_hash(potential_hash_str_from_ext)
+                        
+                        fi["ext_hash"] = assigned_hash
+                        # --- End ext_hash determination ---
+                        
+                        fi["data"] = data
+                        fi["platform"] = Platform.Switch 
+                        fi["unknown1"] = 0 
+
+                        if len(data) > 0x7FFFFFFF: 
+                             status_queue.put({'type':'status','msg':f"  Warning: File {arc_internal_filename} is very large ({len(data)} bytes), may exceed max size supported by ARC entry metadata.",'level':STATUS_WARN})
+                        files_to_pack.append(fi)
+
+                    except Exception as e:
+                        status_queue.put({'type':'status','msg':f"  Error processing file {file_path_obj.relative_to(source_folder_path)} from {folder_name_raw}:{e}",'level':STATUS_ERROR})
+                        status_queue.put({'type':'status','msg':f"  Trace: {traceback.format_exc()}",'level':STATUS_DEBUG})
+                        error_reading_files = True
+
         except (FileNotFoundError, PermissionError) as e:
              status_queue.put({'type':'status','msg':f"Error accessing input folder {folder_name_raw}: {e}",'level':STATUS_ERROR}); return folder_name_raw,False
-        except Exception as e:
+        except Exception as e: 
             status_queue.put({'type':'status','msg':f"An unexpected error occurred scanning folder {folder_name_raw}: {e}",'level':STATUS_ERROR});
             status_queue.put({'type':'status','msg':f"Trace: {traceback.format_exc()}",'level':STATUS_DEBUG});
             return folder_name_raw,False 
 
         if not has_files_in_folder: 
-            status_queue.put({'type':'status','msg':f"Skipping empty folder: {folder_name_raw}",'level':STATUS_WARN}); return folder_name_raw,False
-        if not files_to_pack: 
-            status_queue.put({'type':'status','msg':f"Skipping folder {folder_name_raw} as no files were successfully read.",'level':STATUS_ERROR}); return folder_name_raw,False
-        if error_reading_files:
+            status_queue.put({'type':'status','msg':f"Skipping empty folder (no files found): {folder_name_raw}",'level':STATUS_WARN}); return folder_name_raw,False # Return source folder name for consistency
+        if not files_to_pack and has_files_in_folder : 
+            status_queue.put({'type':'status','msg':f"Skipping folder {folder_name_raw} as no files were successfully processed for packing.",'level':STATUS_ERROR}); return folder_name_raw,False
+        
+        if error_reading_files and files_to_pack: 
              status_queue.put({'type': 'status', 'msg': f"Warning: Some files in {folder_name_raw} had read errors and were skipped.", 'level': STATUS_WARN})
+        elif error_reading_files and not files_to_pack: 
+             status_queue.put({'type': 'status', 'msg': f"All files in {folder_name_raw} had read errors. Skipping rebuild.", 'level': STATUS_ERROR})
+             return folder_name_raw, False
 
-        try: files_to_pack.sort(key=lambda fi: fi.get("full_filename", "")) 
+
+        try: files_to_pack.sort(key=lambda fi_sort: fi_sort.get("full_filename", "")) 
         except Exception as e:
              print(f"Warning: Failed to sort files for folder {folder_name_raw}: {e}", file=sys.stderr)
              status_queue.put({'type':'status','msg':f"Warning: Failed to sort files for {folder_name_raw}.",'level':STATUS_WARN})
@@ -802,10 +881,11 @@ def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str | No
         if output_arc_path.exists():
             if not os.access(output_arc_path, os.W_OK):
                  raise PermissionError(f"Write permission denied for existing output file: {output_arc_path.name}")
-        elif not output_arc_path.parent.exists():
+        elif not output_arc_path.parent.exists(): 
             raise IOError(f"Output parent directory does not exist: {output_arc_path.parent}")
         elif not os.access(output_arc_path.parent, os.W_OK):
              raise PermissionError(f"Write permission denied for output directory: {output_rebuilt_dir.name}")
+        
         try:
             if output_arc_path.resolve().is_relative_to(source_folder_path.resolve()):
                 status_queue.put({'type':'status','msg':f"Error: Output ARC path '{output_arc_path.name}' would be inside the input folder '{folder_name_raw}'. Aborting save.",'level':STATUS_ERROR})
@@ -813,7 +893,7 @@ def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str | No
         except ValueError: pass 
         except Exception as e: 
              status_queue.put({'type':'status','msg':f"Error checking output path safety for {folder_name_raw}: {e}",'level':STATUS_WARN})
-             return folder_name_raw, False
+             
 
         arc.save(str(output_arc_path), files_to_pack, key1=key1, key2=key2) 
 
@@ -863,6 +943,7 @@ def run_batch_parallel(worker_func, item_list, output_dir: str | None, progress_
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor: 
         status_queue = queue.Queue() 
         # Pass output_dir directly (it will be None for _list_extract_worker if called correctly from GUI)
+        # Note: _list_inject_worker's target_arc_filename_override will be default None here.
         futures = [executor.submit(worker_func, str(item), output_dir, key1, key2, status_queue) for item in item_list]
 
 
@@ -950,103 +1031,225 @@ def recursive_batch_extract(source_root_dir: str, output_base_dir: str | None, p
     status_callback(f"Recursive batch extraction complete. Time taken: {duration:.2f} seconds.", STATUS_SUCCESS)
 
 
-# --- Folder Inject Worker and Orchestrator ---
-# (_list_inject_worker is used as the worker for folder inject)
+# --- Folder Inject Worker and Orchestrator (Recursive In-Place) ---
+def folder_batch_inject(source_dir_str: str, progress_callback: callable, status_callback: callable, 
+                        key1: str | None, key2: str | None, max_workers=None):
+    """
+    Recursively finds edited content folders (*_arc) and matching original .arc files
+    in the source_dir_str. Rebuilds ARCs in-place, moving originals and edited
+    folders to an 'original' subdirectory.
+    """
+    status_callback("Scanning for edited content folders and matching ARCs for in-place rebuild...", STATUS_INFO)
+    
+    if not source_dir_str:
+        status_callback("Input Missing: Please select the source directory.", STATUS_ERROR)
+        progress_callback(0); return
 
-def folder_batch_inject(original_arc_dir: str, edited_content_dir: str, output_rebuilt_dir: str, progress_callback: callable, status_callback: callable, key1: str | None, key2: str | None, max_workers=None):
-    """Matches edited folders to original ARCs and rebuilds them in parallel."""
-    status_callback("Scanning for edited content folders and matching ARCs...", STATUS_INFO)
-    original_path = pathlib.Path(original_arc_dir)
-    edited_path = pathlib.Path(edited_content_dir)
-    output_path = pathlib.Path(output_rebuilt_dir)
+    source_path = pathlib.Path(source_dir_str)
+    if not source_path.is_dir():
+        status_callback(f"Source directory not found or is not a directory: {source_dir_str}", STATUS_ERROR)
+        progress_callback(0); return
+    if not os.access(source_path, os.R_OK) or not os.access(source_path, os.W_OK):
+        status_callback(f"Read/Write permission denied for source directory: {source_dir_str}", STATUS_ERROR)
+        progress_callback(0); return
 
-    if not original_arc_dir: status_callback("Input Missing: Select Original ARC directory.", STATUS_ERROR); progress_callback(0); return
-    if not edited_content_dir: status_callback("Input Missing: Select Edited Content directory.", STATUS_ERROR); progress_callback(0); return
-    if not output_rebuilt_dir: status_callback("Output Missing: Select Output directory.", STATUS_ERROR); progress_callback(0); return
-
-    if not original_path.is_dir(): status_callback("Original ARC dir not found.", STATUS_ERROR); progress_callback(0); return
-    if not edited_path.is_dir(): status_callback("Edited content dir not found.", STATUS_ERROR); progress_callback(0); return
-    if not os.access(original_path, os.R_OK): status_callback("Read permission denied for original ARC dir.", STATUS_ERROR); progress_callback(0); return
-    if not os.access(edited_path, os.R_OK): status_callback("Read permission denied for edited content dir.", STATUS_ERROR); progress_callback(0); return
-    try: 
-        if output_path.exists():
-            if not output_path.is_dir(): raise NotADirectoryError(f"Output path exists but is not a directory: {output_rebuilt_dir}")
-            if not os.access(output_path, os.W_OK): raise PermissionError(f"Write permission denied for output directory: {output_rebuilt_dir}")
-        else: output_path.mkdir(parents=True, exist_ok=True)
-    except Exception as e: status_callback(f"Output directory error: {e}", STATUS_ERROR); progress_callback(0); return
-
-    tasks = [] 
-    scan_status_queue = queue.Queue() 
-    def status_callback_local(msg, level): 
-        scan_status_queue.put({'type':'status','msg':msg,'level':level})
-
-    try: 
-        for entry in edited_path.iterdir():
-            if entry.is_dir():
-                folder_name = entry.name
-                orig_arc_basename = folder_name
-                if folder_name.endswith("_arc"):
-                     orig_arc_basename = folder_name[:-4]
-
-                orig_arc = original_path / f"{orig_arc_basename}.arc"
-                out_arc = output_path / f"{orig_arc_basename}.arc" 
-
-                if orig_arc.is_file():
-                    if os.access(orig_arc, os.R_OK):
-                        if orig_arc.resolve() == out_arc.resolve():
-                            status_callback_local(f"Skipping '{folder_name}': Output path is same as original ARC.", STATUS_ERROR)
-                            continue
-                        try:
-                             if out_arc.resolve().is_relative_to(entry.resolve()):
-                                status_callback_local(f"Skipping '{folder_name}': Output ARC path '{out_arc.name}' would be inside the input edited folder '{entry.name}'.", STATUS_ERROR)
-                                continue
-                        except ValueError: pass 
-
-                        tasks.append((entry, orig_arc, out_arc))
-                    else: status_callback_local(f"Skipping '{folder_name}': Read permission denied for original ARC '{orig_arc.name}'.", STATUS_WARN)
-                else: status_callback_local(f"Skipping '{folder_name}': Matching original ARC '{orig_arc.name}' not found.", STATUS_WARN)
+    original_backup_root = source_path / "original"
+    try:
+        original_backup_root.mkdir(parents=True, exist_ok=True)
     except Exception as e:
-         status_callback(f"Error scanning directories for tasks: {e}", STATUS_ERROR)
-         status_callback(f"Trace:{traceback.format_exc()}", STATUS_DEBUG)
-         progress_callback(0); return
+        status_callback(f"Failed to create archive directory '{original_backup_root}': {e}", STATUS_ERROR)
+        progress_callback(0); return
+    
+    tasks_for_submission = [] 
+    
+    scan_status_queue = queue.Queue()
+    def temp_status(msg, level): scan_status_queue.put({'type':'status','msg':msg,'level':level})
 
-    while not scan_status_queue.empty():
-        try: msg = scan_status_queue.get_nowait(); status_callback(msg['msg'], msg['level'])
-        except queue.Empty: break
+    try:
+        for edited_folder in source_path.rglob('*_arc'):
+            if not edited_folder.is_dir():
+                continue
+
+            try:
+                if original_backup_root.resolve() in edited_folder.resolve().parents or \
+                   original_backup_root.resolve() == edited_folder.resolve():
+                    temp_status(f"Skipping already archived or child folder: {edited_folder.relative_to(source_path)}", STATUS_DEBUG)
+                    continue
+            except Exception: 
+                if str(original_backup_root) in str(edited_folder):
+                     temp_status(f"Skipping (path string match) potentially archived folder: {edited_folder.relative_to(source_path)}", STATUS_DEBUG)
+                     continue
 
 
-    if not tasks:
-        status_callback("No matching folders with readable original ARCs found to process.", STATUS_WARN)
+            arc_basename = edited_folder.name[:-4] 
+            original_arc_file = edited_folder.parent / (arc_basename + ".arc")
+
+            if not original_arc_file.is_file() and not (original_backup_root / original_arc_file.relative_to(source_path)).is_file():
+                temp_status(f"Original ARC '{original_arc_file.name}' not found (and not archived) for edited folder '{edited_folder.name}'. Skipping.", STATUS_WARN)
+                continue
+            
+            try:
+                if original_arc_file.is_file() and original_arc_file.resolve().is_relative_to(edited_folder.resolve()):
+                    temp_status(f"Skipping '{edited_folder.name}': Original ARC '{original_arc_file.name}' appears to be inside it.", STATUS_ERROR)
+                    continue
+            except ValueError: pass 
+            except Exception as e: temp_status(f"Path check error for {original_arc_file.name}: {e}", STATUS_WARN)
+
+
+            tasks_for_submission.append({
+                "edited_folder": str(edited_folder),
+                "original_arc_location": str(original_arc_file), 
+                "target_arc_filename": original_arc_file.name 
+            })
+    except Exception as e:
+        status_callback(f"Error scanning source directory for tasks: {e}", STATUS_ERROR)
+        status_callback(f"Trace: {traceback.format_exc()}", STATUS_DEBUG)
+        progress_callback(0); return
+    finally:
+        while not scan_status_queue.empty():
+            try: msg = scan_status_queue.get_nowait(); status_callback(msg['msg'], msg['level'])
+            except queue.Empty: break
+
+
+    if not tasks_for_submission:
+        status_callback("No matching edited folders and original ARCs found to process.", STATUS_WARN)
         progress_callback(100); return
 
-    total_tasks = len(tasks)
-    status_callback(f"Found {total_tasks} folders/ARCs to process. Starting parallel rebuild...", STATUS_INFO);
-    start_time = time.perf_counter() 
-    completed_tasks = 0 
+    total_tasks = len(tasks_for_submission)
+    status_callback(f"Found {total_tasks} items for in-place rebuild. Starting parallel processing...", STATUS_INFO)
+    start_time = time.perf_counter()
+    completed_tasks = 0
+    
+    futures_map = {} 
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor: 
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         worker_status_queue = queue.Queue()
-        futures = [executor.submit(_list_inject_worker, str(task[0]), str(output_path), key1, key2, worker_status_queue) for task in tasks]
 
+        for task_info in tasks_for_submission:
+            original_arc_final_loc_p = pathlib.Path(task_info["original_arc_location"]) 
+            edited_folder_p = pathlib.Path(task_info["edited_folder"])
+            target_arc_filename = task_info["target_arc_filename"] 
 
-        for future in concurrent.futures.as_completed(futures):
+            archive_dest_original_arc = original_backup_root / original_arc_final_loc_p.relative_to(source_path)
+            
+            original_secured = False
+            if original_arc_final_loc_p.exists() and original_arc_final_loc_p.is_file():
+                try:
+                    archive_dest_original_arc.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(original_arc_final_loc_p), str(archive_dest_original_arc))
+                    status_callback(f"Archived original {original_arc_final_loc_p.name} to "
+                                    f"./{archive_dest_original_arc.relative_to(source_path.parent)}", STATUS_DEBUG)
+                    original_secured = True
+                except Exception as e:
+                    status_callback(f"Failed to archive original {original_arc_final_loc_p.name}: {e}. Skipping rebuild.", STATUS_ERROR)
+                    completed_tasks +=1 
+                    progress_callback(completed_tasks / total_tasks * 100)
+                    continue 
+            elif archive_dest_original_arc.exists() and archive_dest_original_arc.is_file(): 
+                 status_callback(f"Original {original_arc_final_loc_p.name} already in archive. Proceeding with rebuild.", STATUS_DEBUG)
+                 original_secured = True
+            else: 
+                status_callback(f"Original ARC {original_arc_final_loc_p.name} not found for securing. Skipping.", STATUS_ERROR)
+                completed_tasks +=1
+                progress_callback(completed_tasks / total_tasks * 100)
+                continue
+
+            if not original_secured: 
+                status_callback(f"Critical: Original {original_arc_final_loc_p.name} could not be secured. Skipping.", STATUS_ERROR)
+                completed_tasks +=1
+                progress_callback(completed_tasks / total_tasks * 100)
+                continue
+
+            future = executor.submit(_list_inject_worker,
+                                     str(edited_folder_p),               
+                                     str(original_arc_final_loc_p.parent), 
+                                     key1, key2, worker_status_queue,
+                                     target_arc_filename)                
+            futures_map[future] = {"original_arc_final_path": str(original_arc_final_loc_p), 
+                                   "edited_folder_path": str(edited_folder_p)}
+
+        for future in concurrent.futures.as_completed(futures_map):
             while not worker_status_queue.empty():
                 try: msg = worker_status_queue.get_nowait(); status_callback(msg['msg'], msg['level'])
                 except queue.Empty: break
-            try:
-                folder_name, success = future.result() 
-            except Exception as e:
-                status_callback(f"Critical error from worker thread result: {e}", STATUS_ERROR)
-                status_callback(f"Trace: {traceback.format_exc()}", STATUS_DEBUG)
-            completed_tasks += 1; progress_callback(completed_tasks / total_tasks * 100)
 
-    end_time = time.perf_counter() 
+            task_details = futures_map[future]
+            original_arc_final_path_str = task_details["original_arc_final_path"]
+            edited_folder_path_str = task_details["edited_folder_path"]
+            
+            original_arc_final_loc = pathlib.Path(original_arc_final_path_str) 
+            edited_folder_to_archive = pathlib.Path(edited_folder_path_str)
+
+            try:
+                _, success = future.result() 
+                if success:
+                    status_callback(f"Successfully rebuilt {original_arc_final_loc.name}.", STATUS_INFO)
+                    archive_dest_edited_folder = original_backup_root / edited_folder_to_archive.relative_to(source_path)
+                    archive_dest_edited_folder.parent.mkdir(parents=True, exist_ok=True)
+
+                    if edited_folder_to_archive.exists() and edited_folder_to_archive.is_dir():
+                        try:
+                            if archive_dest_edited_folder.exists(): 
+                                if archive_dest_edited_folder.is_file() or \
+                                   not archive_dest_edited_folder.is_dir() or \
+                                   any(archive_dest_edited_folder.iterdir()): 
+                                    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                                    archive_name_ts = f"{archive_dest_edited_folder.name}_{timestamp}"
+                                    archive_dest_edited_folder = archive_dest_edited_folder.parent / archive_name_ts
+                                    status_callback(f"Archive destination for {edited_folder_to_archive.name} busy/non-empty. Archiving as {archive_name_ts}", STATUS_WARN)
+                                else: 
+                                    shutil.rmtree(str(archive_dest_edited_folder))
+                            
+                            shutil.move(str(edited_folder_to_archive), str(archive_dest_edited_folder))
+                            status_callback(f"Archived edited folder {edited_folder_to_archive.name} to "
+                                            f"./{archive_dest_edited_folder.relative_to(source_path.parent)}", STATUS_DEBUG)
+                        except Exception as e:
+                            status_callback(f"Failed to archive edited folder {edited_folder_to_archive.name} post-rebuild: {e}", STATUS_ERROR)
+                            status_callback(f"Trace: {traceback.format_exc()}", STATUS_DEBUG)
+                    elif not edited_folder_to_archive.exists():
+                        status_callback(f"Edited folder {edited_folder_to_archive.name} not found for archiving (unexpected).", STATUS_WARN)
+                else: 
+                    status_callback(f"Rebuild failed for {original_arc_final_loc.name}. Attempting to restore original.", STATUS_ERROR)
+                    archived_original_path = original_backup_root / original_arc_final_loc.relative_to(source_path)
+                    if archived_original_path.exists() and archived_original_path.is_file():
+                        try:
+                            if original_arc_final_loc.exists(): 
+                                if original_arc_final_loc.is_dir(): shutil.rmtree(str(original_arc_final_loc))
+                                else: os.remove(str(original_arc_final_loc))
+                            shutil.move(str(archived_original_path), str(original_arc_final_loc))
+                            status_callback(f"Restored original {original_arc_final_loc.name} from archive.", STATUS_INFO)
+                        except Exception as e:
+                            status_callback(f"Failed to restore {original_arc_final_loc.name} from archive {archived_original_path}: {e}", STATUS_ERROR)
+                    else:
+                        status_callback(f"Original {original_arc_final_loc.name} not found in archive for restoration.", STATUS_WARN)
+            
+            except Exception as e:
+                status_callback(f"Critical error processing result for {original_arc_final_loc.name if 'original_arc_final_loc' in locals() else 'an item'}: {e}", STATUS_ERROR)
+                status_callback(f"Trace: {traceback.format_exc()}", STATUS_DEBUG)
+                archived_original_path_on_error = original_backup_root / pathlib.Path(original_arc_final_path_str).relative_to(source_path)
+                current_final_loc_on_error = pathlib.Path(original_arc_final_path_str)
+                if archived_original_path_on_error.exists() and archived_original_path_on_error.is_file():
+                    if not current_final_loc_on_error.exists() or not current_final_loc_on_error.samefile(archived_original_path_on_error):
+                        try:
+                            if current_final_loc_on_error.exists(): 
+                                if current_final_loc_on_error.is_dir(): shutil.rmtree(str(current_final_loc_on_error))
+                                else: os.remove(str(current_final_loc_on_error))
+                            shutil.move(str(archived_original_path_on_error), original_arc_final_path_str)
+                            status_callback(f"Attempted to restore original {current_final_loc_on_error.name} due to processing error.", STATUS_WARN)
+                        except Exception as e_restore:
+                            status_callback(f"Failed to restore {current_final_loc_on_error.name} during error handling: {e_restore}", STATUS_ERROR)
+
+
+            completed_tasks += 1
+            progress_callback(completed_tasks / total_tasks * 100)
+
+    end_time = time.perf_counter()
     duration = end_time - start_time
 
-    while not worker_status_queue.empty():
+    while not worker_status_queue.empty(): 
         try: msg = worker_status_queue.get_nowait(); status_callback(msg['msg'], msg['level'])
         except queue.Empty: break
-    status_callback(f"Folder batch injection (rebuild) complete. Time taken: {duration:.2f} seconds.", STATUS_SUCCESS)
+    status_callback(f"Recursive in-place injection (rebuild) complete. Time taken: {duration:.2f} seconds.", STATUS_SUCCESS)
 
 
 # --- GUI CODE ---
@@ -1055,6 +1258,7 @@ class ArcToolApp:
         self.root = root
         self.root.title("SaladSoftware ARC Tool")
         self.root.configure(bg=BG_COLOR)
+        self.root.geometry("1400x900") # Initial size
 
         self.default_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE)
         self.bold_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE, weight="bold")
@@ -1064,62 +1268,84 @@ class ArcToolApp:
         self.style = ttk.Style()
         self.configure_styles()
 
-        key_frame = ttk.Frame(root, style='TFrame'); key_frame.pack(pady=5, padx=10, fill='x')
-        ttk.Label(key_frame, text="~ Handburger's SaladSoftware MT Framework Arc Tool ~", style='TLabel', font=self.title_font, justify= 'center').grid(row=0, column=0, columnspan=4, sticky='w', pady=(0,5))
+        # Main PanedWindow for resizable sections
+        self.main_paned_window = ttk.PanedWindow(root, orient=tk.VERTICAL, style='TPanedwindow')
+        self.main_paned_window.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # --- Top part (Tabs and controls) ---
+        self.top_pane_frame = ttk.Frame(self.main_paned_window, style='TFrame')
+        self.main_paned_window.add(self.top_pane_frame, weight=3) # Notebook gets more initial space
+
+        key_frame = ttk.Frame(self.top_pane_frame, style='TFrame')
+        key_frame.pack(pady=5, padx=10, fill='x')
+        ttk.Label(key_frame, text="~ Handburger's SaladSoftware MT Framework Arc Tool ~", style='TLabel', font=self.title_font, justify='center').grid(row=0, column=0, columnspan=4, sticky='w', pady=(0,5))
         ttk.Label(key_frame, text="Based on Kuriimu/Karameru C# Code by IcySon55", style='TLabel').grid(row=1, column=0, columnspan=4, sticky='w', pady=(0,10))
         
-        self.notebook = ttk.Notebook(root, style='TNotebook')
+        self.notebook = ttk.Notebook(self.top_pane_frame, style='TNotebook')
         self.list_extract_frame = ttk.Frame(self.notebook, style='TFrame')
         self.list_inject_frame = ttk.Frame(self.notebook, style='TFrame')
         self.rec_extract_frame = ttk.Frame(self.notebook, style='TFrame')
-        self.folder_inject_frame = ttk.Frame(self.notebook, style='TFrame')
+        self.folder_inject_frame = ttk.Frame(self.notebook, style='TFrame') # Recursive In-Place Inject
 
         self.notebook.add(self.list_extract_frame, text='Extract Arc Files (List)')
-        self.notebook.add(self.list_inject_frame, text='Inject Arc Folders into Arc (List)')
-        self.notebook.add(self.rec_extract_frame, text='Recursive Extract Arcs in Directory')
-        self.notebook.add(self.folder_inject_frame, text='Recursive Inject Folder Directory into Arc')
+        self.notebook.add(self.list_inject_frame, text='Inject Arc Folders (List)')
+        self.notebook.add(self.rec_extract_frame, text='Recursive Extract Arcs')
+        self.notebook.add(self.folder_inject_frame, text='Recursive Inject (In-Place)')
         self.notebook.pack(pady=5, padx=10, expand=True, fill='both')
 
         self.create_list_extract_widgets()
         self.create_list_inject_widgets()
         self.create_recursive_extract_widgets()
-        self.create_folder_inject_widgets()
+        self.create_folder_inject_widgets() # For recursive in-place inject
 
-        self.status_frame = ttk.Frame(root, style='Status.TFrame', height=100); self.status_frame.pack(pady=(0, 5), padx=10, fill='x', side=tk.BOTTOM)
-        self.status_frame.grid_rowconfigure(0, weight=1); self.status_frame.grid_columnconfigure(0, weight=1)
-        self.status_text = scrolledtext.ScrolledText(self.status_frame, wrap=tk.WORD, font=self.default_font, bg=WIDGET_BG, fg=TEXT_COLOR, bd=1, relief='sunken', height=8);
-        self.status_text.grid(row=0, column=0, sticky='nsew'); self.status_text.configure(state='disabled')
-        self.status_text.tag_config(STATUS_ERROR, foreground=STATUS_ERROR_FG); self.status_text.tag_config(STATUS_WARN, foreground=STATUS_WARN_FG); self.status_text.tag_config(STATUS_SUCCESS, foreground=STATUS_SUCCESS_FG); self.status_text.tag_config(STATUS_INFO, foreground=STATUS_INFO_FG); self.status_text.tag_config(STATUS_DEBUG, foreground=STATUS_DEBUG_FG)
+        # --- Bottom part (Status and Progress) ---
+        self.bottom_pane_frame = ttk.Frame(self.main_paned_window, style='TFrame')
+        self.main_paned_window.add(self.bottom_pane_frame, weight=1) # Status gets less initial space
 
-        self.progress_var = tk.DoubleVar(); 
-        self.progress_bar = ttk.Progressbar(root, orient='horizontal', length=100, mode='determinate', variable=self.progress_var, style='TProgressbar');
-        self.progress_bar.pack(pady=(0, 10), padx=10, fill='x', side=tk.BOTTOM) 
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(self.bottom_pane_frame, orient='horizontal', length=100, mode='determinate', variable=self.progress_var, style='TProgressbar')
+        self.progress_bar.pack(pady=(0, 5), padx=10, fill='x', side=tk.BOTTOM) # Progress bar at bottom of bottom_pane_frame
+
+        self.status_frame = ttk.Frame(self.bottom_pane_frame, style='Status.TFrame')
+        self.status_frame.pack(pady=(5, 0), padx=10, fill='both', expand=True, side=tk.BOTTOM) # Fill remaining space
+        self.status_frame.grid_rowconfigure(0, weight=1)
+        self.status_frame.grid_columnconfigure(0, weight=1)
+        
+        self.status_text = scrolledtext.ScrolledText(self.status_frame, wrap=tk.WORD, font=self.default_font, bg=WIDGET_BG, fg=TEXT_COLOR, bd=1, relief='sunken', height=8)
+        self.status_text.grid(row=0, column=0, sticky='nsew')
+        self.status_text.configure(state='disabled')
+        self.status_text.tag_config(STATUS_ERROR, foreground=STATUS_ERROR_FG)
+        self.status_text.tag_config(STATUS_WARN, foreground=STATUS_WARN_FG)
+        self.status_text.tag_config(STATUS_SUCCESS, foreground=STATUS_SUCCESS_FG)
+        self.status_text.tag_config(STATUS_INFO, foreground=STATUS_INFO_FG)
+        self.status_text.tag_config(STATUS_DEBUG, foreground=STATUS_DEBUG_FG)
 
         self.check_queue()
 
     def configure_styles(self):
-        self.style.theme_use('clam'); 
-        self.style.configure('.',background=BG_COLOR,foreground=TEXT_COLOR,font=self.default_font,fieldbackground=WIDGET_BG,troughcolor=BG_COLOR,borderwidth=1);
-        self.style.map('.',foreground=[('disabled','#aaaaaa')]);
-        self.style.configure('TFrame',background=BG_COLOR);
-        self.style.configure('Status.TFrame',background=BG_COLOR);
-        self.style.configure('TLabel',background=BG_COLOR,foreground=TEXT_COLOR,padding=5);
-        self.style.configure('Header.TLabel',font=self.bold_font,foreground=TEXT_COLOR);
-        self.style.configure('TButton',background=BUTTON_BG,foreground=BUTTON_FG,bordercolor=BUTTON_BORDER,focuscolor=HIGHLIGHT_BG,lightcolor=BUTTON_BG,darkcolor=BUTTON_BG,padding=6);
-        self.style.map('TButton',background=[('active',BUTTON_ACTIVE_BG),('pressed',BUTTON_PRESSED_BG)],foreground=[('active',BUTTON_FG),('pressed',BUTTON_FG)]);
-        self.style.configure('TEntry',fieldbackground=WIDGET_BG,foreground=INPUT_TEXT_COLOR,insertcolor=INPUT_TEXT_COLOR,bordercolor=BUTTON_BORDER);
-        self.style.map('TEntry',selectbackground=[('focus',HIGHLIGHT_BG)],selectforeground=[('focus',HIGHLIGHT_TEXT)]);
-        self.root.option_add('*Listbox*background',WIDGET_BG);
-        self.root.option_add('*Listbox*foreground',TEXT_COLOR);
-        self.root.option_add('*Listbox*selectBackground',HIGHLIGHT_BG);
-        self.root.option_add('*Listbox*selectForeground',HIGHLIGHT_TEXT);
-        self.root.option_add('*Listbox*font',self.default_font);
-        self.root.option_add('*Listbox*bd',1);
-        self.root.option_add('*Listbox*relief','sunken');
-        self.style.configure('TNotebook',background=BG_COLOR,borderwidth=0);
-        self.style.configure('TNotebook.Tab',background=HEADER_BG,foreground=HEADER_TEXT,padding=[10,5],font=self.default_font,borderwidth=1);
-        self.style.map('TNotebook.Tab',background=[('selected',HEADER_ACTIVE_BG)],foreground=[('selected',HEADER_ACTIVE_TEXT)],expand=[('selected',[1,1,1,1])]);
-        self.style.configure('TProgressbar',thickness=20,background=STATUS_SUCCESS_FG,troughcolor=WIDGET_BG);
+        self.style.theme_use('clam')
+        self.style.configure('.',background=BG_COLOR,foreground=TEXT_COLOR,font=self.default_font,fieldbackground=WIDGET_BG,troughcolor=BG_COLOR,borderwidth=1)
+        self.style.map('.',foreground=[('disabled','#aaaaaa')])
+        self.style.configure('TFrame',background=BG_COLOR)
+        self.style.configure('Status.TFrame',background=BG_COLOR) # Used for status_frame parent
+        self.style.configure('TPanedwindow', background=BG_COLOR)
+        self.style.configure('TLabel',background=BG_COLOR,foreground=TEXT_COLOR,padding=5)
+        self.style.configure('Header.TLabel',font=self.bold_font,foreground=TEXT_COLOR)
+        self.style.configure('TButton',background=BUTTON_BG,foreground=BUTTON_FG,bordercolor=BUTTON_BORDER,focuscolor=HIGHLIGHT_BG,lightcolor=BUTTON_BG,darkcolor=BUTTON_BG,padding=6)
+        self.style.map('TButton',background=[('active',BUTTON_ACTIVE_BG),('pressed',BUTTON_PRESSED_BG)],foreground=[('active',BUTTON_FG),('pressed',BUTTON_FG)])
+        self.style.configure('TEntry',fieldbackground=WIDGET_BG,foreground=INPUT_TEXT_COLOR,insertcolor=INPUT_TEXT_COLOR,bordercolor=BUTTON_BORDER)
+        self.style.map('TEntry',selectbackground=[('focus',HIGHLIGHT_BG)],selectforeground=[('focus',HIGHLIGHT_TEXT)])
+        self.root.option_add('*Listbox*background',WIDGET_BG)
+        self.root.option_add('*Listbox*foreground',TEXT_COLOR)
+        self.root.option_add('*Listbox*selectBackground',HIGHLIGHT_BG)
+        self.root.option_add('*Listbox*selectForeground',HIGHLIGHT_TEXT)
+        self.root.option_add('*Listbox*font',self.default_font)
+        self.root.option_add('*Listbox*bd',1)
+        self.root.option_add('*Listbox*relief','sunken')
+        self.style.configure('TNotebook',background=BG_COLOR,borderwidth=0)
+        self.style.configure('TNotebook.Tab',background=HEADER_BG,foreground=HEADER_TEXT,padding=[10,5],font=self.default_font,borderwidth=1)
+        self.style.map('TNotebook.Tab',background=[('selected',HEADER_ACTIVE_BG)],foreground=[('selected',HEADER_ACTIVE_TEXT)],expand=[('selected',[1,1,1,1])])
+        self.style.configure('TProgressbar',thickness=20,background=STATUS_SUCCESS_FG,troughcolor=WIDGET_BG)
 
 
     def _create_dir_input(self, parent, label, row, var_name):
@@ -1144,10 +1370,9 @@ class ArcToolApp:
         ttk.Button(bf, text="Select Files", command=self.select_list_extract_files).pack(side=tk.LEFT, padx=5, pady=5)
         ttk.Button(bf, text="Clear List", command=lambda: self.list_extract_listbox.delete(0, tk.END)).pack(side=tk.RIGHT, padx=5, pady=5)
         
-        # Output directory explanation label
         ttk.Label(frame, text="Output: Folders named <filename>_arc will be created next to each input .arc file.", style='TLabel').grid(row=3, column=0, columnspan=3, sticky='w', padx=5, pady=(10,5))
         
-        ttk.Button(frame, text="Start Extraction", command=self.start_list_extraction).grid(row=4, column=0, columnspan=3, pady=(20,10)) # Adjusted row
+        ttk.Button(frame, text="Start Extraction", command=self.start_list_extraction).grid(row=4, column=0, columnspan=3, pady=(20,10)) 
 
     def create_list_inject_widgets(self):
         frame=self.list_inject_frame; frame.grid_columnconfigure(0, weight=1); frame.grid_rowconfigure(1, weight=1) 
@@ -1164,17 +1389,21 @@ class ArcToolApp:
         frame=self.rec_extract_frame; frame.grid_columnconfigure(0, weight=1); 
         self._create_dir_input(frame, "Source ARC Directory (Recursive):", 0, "rec_extract_source_var")
         
-        # Output directory explanation label
         ttk.Label(frame, text="Output: Folders named <filename>_arc will be created next to each found .arc file.", style='TLabel').grid(row=2, column=0, sticky='w', padx=5, pady=(10,5))
         
-        ttk.Button(frame, text="Start Recursive Extraction", command=self.start_recursive_extraction).grid(row=3, column=0, pady=(20,10)) # Adjusted row
+        ttk.Button(frame, text="Start Recursive Extraction", command=self.start_recursive_extraction).grid(row=3, column=0, pady=(20,10))
 
-    def create_folder_inject_widgets(self):
+    def create_folder_inject_widgets(self): # Renamed to reflect "Recursive Inject (In-Place)"
         frame=self.folder_inject_frame; frame.grid_columnconfigure(0, weight=1); 
-        self._create_dir_input(frame, "Original ARC Directory:", 0, "folder_inject_orig_arc_var")
-        self._create_dir_input(frame, "Edited Content Directory (Contains Folders):", 2, "folder_inject_edited_dir_var")
-        self._create_dir_input(frame, "Output Rebuilt ARC Directory:", 4, "folder_inject_output_var")
-        ttk.Button(frame, text="Start Folder Injection", command=self.start_folder_injection).grid(row=6, column=0, pady=(20,10))
+        self._create_dir_input(frame, "Source Directory (contains .arc files and _arc folders):", 0, "folder_inject_source_dir_var")
+        
+        info_text = ("Rebuilds .arc files found alongside corresponding _arc folders.\n"
+                     "Original .arc files and _arc folders will be moved into an 'original' subfolder \n"
+                     "at the root of the Source Directory, preserving their relative paths.\n"
+                     "The new rebuilt .arc files will replace the originals.")
+        ttk.Label(frame, text=info_text, style='TLabel', justify=tk.LEFT).grid(row=2, column=0, sticky='w', padx=5, pady=(10,5))
+
+        ttk.Button(frame, text="Start In-Place Rebuild", command=self.start_folder_injection).grid(row=3, column=0, pady=(20,10))
 
 
     def select_list_extract_files(self):
@@ -1186,7 +1415,9 @@ class ArcToolApp:
                     self.list_extract_listbox.insert(tk.END, f)
 
     def select_list_inject_folders(self):
-        directory=filedialog.askdirectory(title="Select Source Folder")
+        # Allow selecting multiple folders if system dialog supports it (Windows does with a workaround)
+        # For simplicity, sticking to one-by-one for now unless askdirectory has a multi option
+        directory=filedialog.askdirectory(title="Select Source Folder(s) to Add to List")
         if directory:
             current_items = set(self.list_inject_listbox.get(0, tk.END))
             if directory not in current_items:
@@ -1194,20 +1425,32 @@ class ArcToolApp:
 
 
     def _run_task(self, target_func, args_tuple):
-        k1, k2 = None, None 
-        full_args = args_tuple + (self.update_progress, self.queue_status, k1, k2)
+        k1, k2 = None, None # For now, keys are not taken from GUI. Could be added later.
+        
+        # Adapt arguments for different functions
+        # The core functions now expect (..., progress_callback, status_callback, key1, key2)
+        # For folder_batch_inject, output_dir is implicit in source_dir
+        if target_func == folder_batch_inject:
+            # folder_batch_inject(source_dir, progress_callback, status_callback, key1, key2, max_workers=None)
+            # args_tuple = (source_dir_str,)
+            full_args = args_tuple + (self.update_progress, self.queue_status, k1, k2)
+        else:
+            # Most other functions: (..., item_list_or_src_dir, output_dir_or_None, progress_callback, status_callback, key1, key2)
+            # args_tuple = (worker_func_or_src_dir, items_or_output_dir, output_dir_or_None_if_3rd_arg)
+            full_args = args_tuple + (self.update_progress, self.queue_status, k1, k2)
+
         self.progress_var.set(0)
         task_name = target_func.__name__.replace('_batch', '').replace('_list', ' List').replace('_recursive', ' Recursive').replace('_folder', ' Folder').replace('_', ' ').strip().title()
         self.add_status_message(f"Starting {task_name} task...", STATUS_INFO)
+        
         thread = threading.Thread(target=target_func, args=full_args, daemon=True) 
         thread.start()
 
 
     def start_list_extraction(self):
         items = self.list_extract_listbox.get(0, tk.END)
-        # out_dir is no longer taken from GUI for this operation
         if not items: messagebox.showwarning("Input Missing","Please select one or more ARC files to extract."); return
-        # Pass None for out_dir, as _list_extract_worker will place output next to source
+        # _list_extract_worker output_dir is None (output next to source)
         self._run_task(run_batch_parallel, (_list_extract_worker, items, None))
 
 
@@ -1216,27 +1459,26 @@ class ArcToolApp:
         out_dir = self.list_inject_output_var.get() 
         if not items: messagebox.showwarning("Input Missing","Please add one or more source folders to inject."); return
         if not out_dir: messagebox.showwarning("Output Missing","Please select an output directory."); return
-        for folder_path in items:
-            if not os.path.isdir(folder_path): messagebox.showerror("Input Invalid",f"Source folder not found: {folder_path}"); return
+        for folder_path_str in items:
+            if not os.path.isdir(folder_path_str): 
+                messagebox.showerror("Input Invalid",f"Source folder not found: {folder_path_str}"); return
         self._run_task(run_batch_parallel, (_list_inject_worker, items, out_dir))
 
 
     def start_recursive_extraction(self):
         src = self.rec_extract_source_var.get()
-        # out (output_base_dir) is no longer taken from GUI for this operation
         if not src: messagebox.showwarning("Input Missing","Please select the source directory containing ARC files."); return
-        # Pass None for out_dir, as _list_extract_worker will place output next to source
+        # recursive_batch_extract's output_base_dir is None (output next to source via _list_extract_worker)
         self._run_task(recursive_batch_extract, (src, None))
 
 
-    def start_folder_injection(self):
-        orig = self.folder_inject_orig_arc_var.get()
-        edit = self.folder_inject_edited_dir_var.get()
-        out = self.folder_inject_output_var.get()
-        if not orig: messagebox.showwarning("Input Missing","Please select the directory containing original ARC files."); return
-        if not edit: messagebox.showwarning("Input Missing","Please select the directory containing edited content folders."); return
-        if not out: messagebox.showwarning("Output Missing","Please select the output directory for rebuilt ARCs."); return
-        self._run_task(folder_batch_inject, (orig, edit, out))
+    def start_folder_injection(self): # This is for the "Recursive Inject (In-Place)" tab
+        src_dir = self.folder_inject_source_dir_var.get()
+        if not src_dir: messagebox.showwarning("Input Missing","Please select the source directory."); return
+        
+        # folder_batch_inject(source_dir_str, progress_callback, status_callback, key1, key2, max_workers=None)
+        # The _run_task will append progress_callback, status_callback, k1, k2
+        self._run_task(folder_batch_inject, (src_dir,))
 
 
     def update_progress(self,v):
@@ -1280,14 +1522,30 @@ class ArcToolApp:
 if __name__ == "__main__":
     try: from Crypto.Cipher import Blowfish
     except ImportError:
+        # Attempt to show Tkinter messagebox even if main GUI hasn't started
+        temp_root = tk.Tk()
+        temp_root.withdraw() # Hide the root window
         messagebox.showerror("Dependency Missing","Required library 'pycryptodome' not found.\nPlease install it using:\npip install pycryptodome")
+        temp_root.destroy()
         sys.exit(1) 
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Use the EXTENSION_MAP_FILE constant which is now "unique_extensions.txt"
     extension_map_file_path = os.path.join(script_dir, EXTENSION_MAP_FILE)
+    
+    # Ensure unique_extensions.txt exists or prompt user
+    if not os.path.exists(extension_map_file_path):
+        temp_root_warn = tk.Tk()
+        temp_root_warn.withdraw()
+        messagebox.showwarning("Extension Map Missing", 
+                               f"The extension map file '{EXTENSION_MAP_FILE}' was not found in the script directory:\n'{script_dir}'\n"
+                               "Please ensure it exists. Extensions may not be resolved correctly.")
+        temp_root_warn.destroy()
+        # Proceed with empty map if file is missing, load_extension_map will print a warning.
+    
     load_extension_map(extension_map_file_path)
-    if not EXTENSION_MAP: 
-         messagebox.showwarning("Extension Map", f"Could not load or parse '{EXTENSION_MAP_FILE}' from '{extension_map_file_path}'.\nFile extensions will be derived from hashes only.")
+    # No need for a separate messagebox if EXTENSION_MAP is empty after load,
+    # as load_extension_map already prints warnings/errors.
 
     root = tk.Tk()
     app = ArcToolApp(root)
