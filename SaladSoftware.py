@@ -1,7 +1,9 @@
 # Handburger's MT Framework ARC Decryptor/Extractor
-# This script is a Python port of the original C# code from IcySon55's Kuriimu project.
+# This script is a Python port of the original C# code from IcySon55's Kuriimu and FanTranslatorsInternational's Kuriimu2.
+# Kuriimu2 has a GPL-3.0 license, and this script is intended for strictly personal use.
 # It is designed to process and extract files from MT Framework ARC archives.
 # The script includes various utility functions, a GUI for user interaction, and support for Blowfish encryption/decryption.
+# Version 1.3.0
 
 # --- IMPORTS ---
 import tkinter as tk
