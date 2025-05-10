@@ -1,4 +1,6 @@
 SaladSoftware - A Kuriimu1/2 MT Framework-only Python Variant
+![Screenshot 2025-05-09 123142](https://github.com/user-attachments/assets/88742bf3-1e9f-443b-8be5-d3b23ff674ea)
+![Screenshot 2025-05-09 121140](https://github.com/user-attachments/assets/e23ae47c-b4db-4d64-9464-68096804baf7)
 
 - Uses Dark Mode
 - Has individual and recursive arc extraction and injection
@@ -23,7 +25,8 @@ Tab Descriptions:
            - By default, ARCs are created using parameters suitable for Switch games (Version 9, Little Endian).
 
         * Recursive Extract Arcs
-           - Select a root directory.
+           - Select a root directory.![Screenshot 2025-05-09 123142](https://github.com/user-attachments/assets/cf89e0f2-2bb0-4ce4-af83-d609ff52a111)
+
            - The tool will scan this directory and all its subdirectories for .arc files.
            - Each found .arc file is extracted similarly to 'Extract Arc Files (List)' (into its own subfolder, next to the ARC).
            - You can keep track of what is happening via the log on the bottom. 
