@@ -1,4 +1,4 @@
-SaladSoftware - A Kuriimu1/2 MT Framework-only Python Variant
+# SaladSoftware - A Kuriimu1/2 MT Framework-only Python Variant
 ![Screenshot 2025-05-09 123142](https://github.com/user-attachments/assets/88742bf3-1e9f-443b-8be5-d3b23ff674ea)
 ![Screenshot 2025-05-09 121140](https://github.com/user-attachments/assets/e23ae47c-b4db-4d64-9464-68096804baf7)
 
@@ -10,7 +10,7 @@ BurgerSoftware uses Kuriimu2-dev C# code. I did not do this myself.
 HotdogSoftware uses Kuriimu2 as well.
 SaladSoftware uses Kuriimu (1) Karameru C# code, but uses python instead. Original MTArc, Komponent, Encryption, and C# code processing belongs to IcySon55 and FanTranslatorInternational, all I did was adapt it to Python and add a darkmode and log so its clearer what the app is doing while stalled.
 
-Tab Descriptions:
+## Tab Descriptions
 
         * Extract Arc Files
            - Select one or more .arc files.
