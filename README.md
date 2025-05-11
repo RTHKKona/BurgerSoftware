@@ -1,4 +1,6 @@
-SaladSoftware - A Kuriimu1/2 MT Framework-only Python Variant
+# SaladSoftware - A Kuriimu1/2 MT Framework-only Python Variant
+![Screenshot 2025-05-09 123142](https://github.com/user-attachments/assets/88742bf3-1e9f-443b-8be5-d3b23ff674ea)
+![Screenshot 2025-05-09 121140](https://github.com/user-attachments/assets/e23ae47c-b4db-4d64-9464-68096804baf7)
 
 - Uses Dark Mode
 - Has individual and recursive arc extraction and injection
@@ -8,7 +10,7 @@ BurgerSoftware uses Kuriimu2-dev C# code. I did not do this myself.
 HotdogSoftware uses Kuriimu2 as well.
 SaladSoftware uses Kuriimu (1) Karameru C# code, but uses python instead. Original MTArc, Komponent, Encryption, and C# code processing belongs to IcySon55 and FanTranslatorInternational, all I did was adapt it to Python and add a darkmode and log so its clearer what the app is doing while stalled.
 
-Tab Descriptions:
+## Tab Descriptions
 
         * Extract Arc Files
            - Select one or more .arc files.
@@ -23,7 +25,8 @@ Tab Descriptions:
            - By default, ARCs are created using parameters suitable for Switch games (Version 9, Little Endian).
 
         * Recursive Extract Arcs
-           - Select a root directory.
+           - Select a root directory.![Screenshot 2025-05-09 123142](https://github.com/user-attachments/assets/cf89e0f2-2bb0-4ce4-af83-d609ff52a111)
+
            - The tool will scan this directory and all its subdirectories for .arc files.
            - Each found .arc file is extracted similarly to 'Extract Arc Files (List)' (into its own subfolder, next to the ARC).
            - You can keep track of what is happening via the log on the bottom. 
@@ -51,3 +54,10 @@ Tab Descriptions:
            - Click "Extract Selected Items".
              - If a file is checked, it's saved to: `output_dir/filename.ext`
              - If a folder (e.g., 'textures/player') is checked, its contents are saved to: `output_dir/player/content_file.ext`, preserving the structure *relative to the checked folder*.
+
+
+## Compiling
+
+I used ``` pyinstaller --name "SaladSoftware" --onefile --windowed --icon="salad_icon.ico" --add-data "extension_index_line.txt:." --add-data "unique_extensions.txt:." --hidden-import "Crypto.Cipher.Blowfish" SaladSoftware.py ``` to compile this project into an exe.
+
+###### buh
