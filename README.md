@@ -54,3 +54,10 @@ SaladSoftware uses Kuriimu (1) Karameru C# code, but uses python instead. Origin
            - Click "Extract Selected Items".
              - If a file is checked, it's saved to: `output_dir/filename.ext`
              - If a folder (e.g., 'textures/player') is checked, its contents are saved to: `output_dir/player/content_file.ext`, preserving the structure *relative to the checked folder*.
+
+
+## Compiling
+
+I used ``` pyinstaller --name "SaladSoftware" --onefile --windowed --icon="salad_icon.ico" --add-data "extension_index_line.txt:." --add-data "unique_extensions.txt:." --hidden-import "Crypto.Cipher.Blowfish" SaladSoftware.py ``` to compile this project into an exe.
+
+###### buh
