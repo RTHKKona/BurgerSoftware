@@ -22,8 +22,6 @@ import traceback # For detailed error info
 import time # For timing operations
 from collections import namedtuple
 from Crypto.Cipher import Blowfish
-# from Crypto.Util.Padding import pad, unpad # Using manual null padding
-# from Crypto.Random import get_random_bytes # Not currently needed
 from datetime import datetime # For timestamps
 import shutil # For moving files/folders
 import re # For improved filename sanitization
@@ -75,6 +73,19 @@ REV_EXTENSION_MAP = {}
 EXTENSION_MAP_FILE = "unique_extensions.txt"
 GAME_SPECIFIC_HASH_FILE = "extension_index_line.txt"
 
+# Sourcing Files
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        # sys._MEIPASS is not defined, so we are not running from a PyInstaller bundle
+        base_path = os.path.abspath(".") # Or pathlib.Path(__file__).parent
+
+    return os.path.join(base_path, relative_path)
+    # Or for pathlib: return pathlib.Path(base_path) / relative_path
 
 # --- ARC UTILITIES & MTArc Class ---
 
@@ -1347,10 +1358,23 @@ def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str | No
             bo_name_desc = "BE" if original_arc_byte_order_char == '>' else "LE"
             name_len_desc = "128b" if entry_has_extended_names_for_rebuild else "64b"
             arcc_desc = f", ARCC:{target_is_arcc}" if target_is_arcc or (original_file_metadata_map is not None and target_is_arcc) else ""
-            arc_params_desc = f"original (v{original_arc_version}, P:{p_name_desc}, BO:{bo_name_desc}, Names:{name_len_desc}{arcc_desc})"
-        elif target_is_arcc:
+            
+            using_original_params_for_non_default = not (
+                original_arc_version == DEFAULT_VERSION and
+                original_arc_platform == DEFAULT_PLATFORM and
+                original_arc_byte_order_char == DEFAULT_BYTE_ORDER_CHAR and
+                not entry_has_extended_names_for_rebuild and # Assuming default is False
+                not target_is_arcc # Assuming default is False
+            )
+            if using_original_params_for_non_default or original_file_order is not None or original_file_metadata_map:
+                arc_params_desc = f"original (v{original_arc_version}, P:{p_name_desc}, BO:{bo_name_desc}, Names:{name_len_desc}{arcc_desc})"
+            # Else, it implies it's effectively using default values even if they were "read" from an original.
+            # The existing default arc_params_desc will be used, or the ARCC one below.
+
+        elif target_is_arcc: # This case applies if original params were not all present, but it's ARCC
             name_len_desc = "128b" if entry_has_extended_names_for_rebuild else "64b"
             arc_params_desc = f"ARCC format (default PC v17, LE, Names:{name_len_desc})"
+
 
         key_info_desc = ""
         if target_is_arcc and not (key1 and key2): key_info_desc = " (Default ARCC Keys)"
@@ -1972,10 +1996,10 @@ class ArcToolApp:
 
     def create_list_inject_widgets(self):
         frame=self.list_inject_frame; frame.grid_columnconfigure(0, weight=1); frame.grid_rowconfigure(1, weight=1); ttk.Label(frame, text="Input Source Folders:", style='Header.TLabel').grid(row=0, column=0, columnspan=3, sticky='w', pady=(10,5))
-        lb_frame = ttk.Frame(frame); lb_frame.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky='nsew'); lb_frame.grid_rowconfigure(0, weight=1); lb_frame.grid_columnconfigure(0, weight=1)
+        lb_frame = ttk.Frame(frame); lb_frame.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky='nsew'); lb_frame.grid_rowconfigure(0, weight=1); lb_frame.grid_columnconfigure(0, weight=1) # More pady
         self.list_inject_listbox=tk.Listbox(lb_frame, width=80, height=10, selectmode=tk.EXTENDED); self.list_inject_listbox.grid(row=0, column=0, sticky='nsew'); sb=ttk.Scrollbar(lb_frame, orient='vertical', command=self.list_inject_listbox.yview, style='Vertical.TScrollbar'); sb.grid(row=0, column=1, sticky='nsw'); self.list_inject_listbox.config(yscrollcommand=sb.set)
         bf=ttk.Frame(frame); bf.grid(row=2, column=0, columnspan=2, sticky='ew', padx=5, pady=5); ttk.Button(bf, text="Add Folder", command=self.select_list_inject_folders).pack(side=tk.LEFT, padx=(0,10), pady=5); ttk.Button(bf, text="Clear List", command=lambda: self.list_inject_listbox.delete(0, tk.END)).pack(side=tk.LEFT, padx=(0,10), pady=5)
-        self._create_dir_input(frame, "Output Rebuilt ARC Directory:", 3, "list_inject_output_var"); ttk.Button(frame, text="Start Rebuild (Defaults)", command=self.start_list_injection).grid(row=5, column=0, columnspan=3, pady=(10,10))
+        self._create_dir_input(frame, "Output Rebuilt ARC Directory:", 3, "list_inject_output_var"); ttk.Button(frame, text="Start Rebuild", command=self.start_list_injection).grid(row=5, column=0, columnspan=3, pady=(10,10))
 
     def create_recursive_extract_widgets(self):
         frame=self.rec_extract_frame; frame.grid_columnconfigure(0, weight=1);
@@ -2259,6 +2283,7 @@ class ArcToolApp:
             self._set_tree_item_checked_state(parent_iid, new_parent_checked_state, recursive=False, update_parent=True)
         # else:
             # self.add_status_message(f"Debug: Parent {parent_iid} checkbox NO change from {current_parent_checked_state}", STATUS_DEBUG)
+
     def _run_task(self, target_func, args_tuple=(), kwargs_dict=None,
                   original_arc_params_list=None,
                   target_is_arcc_list=None,
@@ -2304,12 +2329,106 @@ class ArcToolApp:
         self._run_task(run_batch_parallel, (_list_extract_worker, items, None)) # output_dir is None for this worker
 
     def start_list_injection(self):
-        items = self.list_inject_listbox.get(0, tk.END); out_dir = self.list_inject_output_var.get()
-        if not items: messagebox.showwarning("Input Missing","Please add one or more source folders to rebuild."); return
-        if not out_dir: messagebox.showwarning("Output Missing","Please select an output directory for the rebuilt ARC files."); return
-        for folder_path_str in items:
-            if not os.path.isdir(folder_path_str): messagebox.showerror("Input Invalid",f"Source folder not found or is not a directory: {folder_path_str}"); return
-        self._run_task(run_batch_parallel, (_list_inject_worker, items, out_dir))
+        items_folder_paths_str = self.list_inject_listbox.get(0, tk.END)
+        output_rebuilt_dir_str = self.list_inject_output_var.get()
+
+        if not items_folder_paths_str:
+            messagebox.showwarning("Input Missing", "Please add one or more source folders to rebuild.")
+            return
+        if not output_rebuilt_dir_str:
+            messagebox.showwarning("Output Missing", "Please select an output directory for the rebuilt ARC files.")
+            return
+
+        # Validate all source folders exist before proceeding
+        for folder_path_str_val in items_folder_paths_str:
+            if not os.path.isdir(folder_path_str_val):
+                messagebox.showerror("Input Invalid", f"Source folder not found or is not a directory: {folder_path_str_val}")
+                return
+
+        all_original_arc_params_dicts = [] 
+        all_target_is_arcc_flags = []    
+        all_original_file_orders = []    
+        all_original_file_metadata_maps = [] 
+
+        self.add_status_message("Preparing parameters for List Injection...", STATUS_INFO)
+
+        default_params_values = {
+            "version": DEFAULT_VERSION,
+            "platform": DEFAULT_PLATFORM,
+            "bo_char": DEFAULT_BYTE_ORDER_CHAR,
+            "is_arcc": False, 
+            "file_order": None,
+            "entry_has_extended_names": False, 
+            "original_file_metadata_map": {} 
+        }
+
+        for folder_path_str_item in items_folder_paths_str:
+            folder_path_obj_item = pathlib.Path(folder_path_str_item)
+            current_params_for_item = default_params_values.copy() 
+
+            if folder_path_obj_item.name.endswith("_arc"):
+                arc_basename_item = folder_path_obj_item.name[:-4]
+                potential_original_arc_path_item = folder_path_obj_item.parent / (arc_basename_item + ".arc")
+
+                if potential_original_arc_path_item.is_file():
+                    self.add_status_message(f"Found potential original ARC '{potential_original_arc_path_item.name}' for folder '{folder_path_obj_item.name}'. Attempting to load parameters...", STATUS_DEBUG)
+                    temp_arc_loader_item = MTArc()
+                    temp_load_status_queue_item = queue.Queue() 
+                    try:
+                        temp_arc_loader_item.load(str(potential_original_arc_path_item), status_queue=temp_load_status_queue_item)
+                        while not temp_load_status_queue_item.empty():
+                            msg_item_load = temp_load_status_queue_item.get_nowait()
+                            self.queue_status(f"(Param scan for {potential_original_arc_path_item.name}) {msg_item_load['msg']}", msg_item_load['level'])
+
+                        if temp_arc_loader_item.arc_header: 
+                            file_meta_map_item = {}
+                            if temp_arc_loader_item.files:
+                                for fi_orig_item in temp_arc_loader_item.files:
+                                    norm_path_key_item = fi_orig_item['full_filename'].lower().replace('\\', '/')
+                                    file_meta_map_item[norm_path_key_item] = {
+                                        'is_compressed': fi_orig_item['is_compressed'],
+                                        'uncompressed_size_raw': fi_orig_item['uncompressed_size_raw']
+                                    }
+                            
+                            current_params_for_item.update({
+                                "version": temp_arc_loader_item.version,
+                                "platform": temp_arc_loader_item.platform,
+                                "bo_char": temp_arc_loader_item.byte_order_char,
+                                "is_arcc": temp_arc_loader_item.is_arcc,
+                                "file_order": [fi['full_filename'] for fi in temp_arc_loader_item.files] if temp_arc_loader_item.files else [],
+                                "entry_has_extended_names": temp_arc_loader_item.entry_has_extended_names,
+                                "original_file_metadata_map": file_meta_map_item
+                            })
+                            self.add_status_message(f"Using parameters from '{potential_original_arc_path_item.name}' for '{folder_path_obj_item.name}'.", STATUS_INFO)
+                        else:
+                            self.add_status_message(f"Failed to load header from '{potential_original_arc_path_item.name}'. Using default parameters for '{folder_path_obj_item.name}'.", STATUS_WARN)
+                    except Exception as e_load_params_item:
+                        self.add_status_message(f"Error loading parameters from '{potential_original_arc_path_item.name}' for '{folder_path_obj_item.name}': {e_load_params_item}. Using defaults.", STATUS_WARN)
+                        # traceback.print_exc(file=sys.stderr) # Optional: for more detailed debugging if needed
+                    finally:
+                        if temp_arc_loader_item: temp_arc_loader_item.close()
+                else:
+                    self.add_status_message(f"No original ARC found for '{folder_path_obj_item.name}' (expected '{potential_original_arc_path_item.name}'). Using default parameters.", STATUS_DEBUG)
+            else:
+                self.add_status_message(f"Folder '{folder_path_obj_item.name}' does not end with '_arc'. Using default parameters.", STATUS_DEBUG)
+
+            param_dict_for_worker_item = {
+                "version": current_params_for_item["version"],
+                "platform": current_params_for_item["platform"],
+                "bo_char": current_params_for_item["bo_char"],
+                "entry_has_extended_names": current_params_for_item["entry_has_extended_names"]
+            }
+            all_original_arc_params_dicts.append(param_dict_for_worker_item)
+            all_target_is_arcc_flags.append(current_params_for_item["is_arcc"])
+            all_original_file_orders.append(current_params_for_item["file_order"]) 
+            all_original_file_metadata_maps.append(current_params_for_item["original_file_metadata_map"])
+
+        self._run_task(run_batch_parallel, 
+                       args_tuple=(_list_inject_worker, items_folder_paths_str, output_rebuilt_dir_str),
+                       original_arc_params_list=all_original_arc_params_dicts,
+                       target_is_arcc_list=all_target_is_arcc_flags,
+                       original_file_orders_list=all_original_file_orders,
+                       original_file_metadata_map_list=all_original_file_metadata_maps)
 
 
     def start_recursive_extraction(self):
@@ -2572,7 +2691,7 @@ class ArcToolApp:
            - Add one or more source folders to the list. These folders contain files you want to pack into ARCs.
            - Select an output directory where the new .arc files will be saved.
            - Each source folder is rebuilt into a new .arc file (e.g., 'my_mod_folder' becomes 'my_mod_folder.arc').
-           - By default, ARCs are created using parameters suitable for Switch games (Version 9, Little Endian).
+           - If a folder is named 'myarc_arc' and 'myarc.arc' exists in the same directory, parameters (version, platform, file order, etc.) from 'myarc.arc' will be used for the rebuild. Otherwise, default parameters (typically Switch v9, Little Endian) are used.
 
         3. Recursive Extract Arcs:
            - Select a root directory.
@@ -2670,12 +2789,13 @@ if __name__ == "__main__":
             print(f"ERROR: Error initializing 'pycryptodome': {e_crypto_test}", file=sys.stderr)
         sys.exit(1)
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    primary_extension_map_path = os.path.join(script_dir, EXTENSION_MAP_FILE)
-    game_specific_map_path = os.path.join(script_dir, GAME_SPECIFIC_HASH_FILE)
+    primary_extension_map_path = resource_path(EXTENSION_MAP_FILE)
+    game_specific_map_path = resource_path(GAME_SPECIFIC_HASH_FILE)
 
     if not os.path.exists(primary_extension_map_path):
-        warning_msg = (f"Primary extension map file '{EXTENSION_MAP_FILE}' not found in the script directory:\n'{script_dir}'.\n"
+        # Adjusted warning message to be more generic about file location
+        warning_msg = (f"Primary extension map file '{EXTENSION_MAP_FILE}' not found where expected.\n"
+                       "It should be bundled with the application or in the same directory as the script if run directly.\n"
                        "Extracted files might have generic hexadecimal extensions (e.g., .1234ABCD) instead of meaningful ones (e.g., .tex).")
         try:
             temp_root_warn = tk.Tk(); temp_root_warn.withdraw();
@@ -2689,5 +2809,3 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = ArcToolApp(root)
     root.mainloop()
-
-#buh
