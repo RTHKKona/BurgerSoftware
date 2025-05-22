@@ -3,7 +3,7 @@
 # Kuriimu2 has a GPL-3.0 license, and this script is intended for strictly personal use.
 # It is designed to process and extract files from MT Framework ARC archives.
 # The script includes various utility functions, a GUI for user interaction, and support for Blowfish encryption/decryption.
-# Version 1.3.0
+# Version 1.3.2 (Fixed D&D init, Changed Font)
 
 # --- IMPORTS ---
 import tkinter as tk
@@ -27,6 +27,11 @@ import shutil # For moving files/folders
 import re # For improved filename sanitization
 import textwrap # Added for help dialog formatting
 
+# ADDED: For Drag and Drop
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:
+    TkinterDnD = None # Flag that it's not available
 
 # --- CONSTANTS ---
 # --- Color Scheme ---
@@ -37,7 +42,7 @@ HEADER_ACTIVE_TEXT='#ffffff';HIGHLIGHT_BG='#52596b';HIGHLIGHT_TEXT='#00f7ff'
 STATUS_ERROR_FG='#ff6b6b';STATUS_WARN_FG='#ffb366';STATUS_SUCCESS_FG='#86e3a0'
 STATUS_INFO_FG=TEXT_COLOR;STATUS_DEBUG_FG='#999999';CHECKED_TEXT_FG='#00f7ff'
 # --- Font ---
-FONT_FAMILY="JetBrains Mono";FONT_SIZE=10;FONT_SETTINGS=(FONT_FAMILY,FONT_SIZE)
+FONT_FAMILY="Ubuntu Mono";FONT_SIZE=13;FONT_SETTINGS=(FONT_FAMILY,FONT_SIZE) # MODIFIED: Font family changed
 # --- Platform Enum ---
 class Platform: UNKNOWN=0; PC=1; CTR=2; PS3=3; Switch=4
 # --- ARC Constants ---
@@ -1872,7 +1877,7 @@ class ArcToolApp:
         self.root = root;
         self.root.title("SaladSoftware ARC Tool");
         self.root.configure(bg=BG_COLOR);
-        self.root.geometry("1045x980+0+0"); # MODIFIED: Height reduced by 100px
+        self.root.geometry("1045x980+0+0");
         self.default_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE); 
         self.bold_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE, weight="bold"); 
         self.title_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE + 2, weight="bold")
@@ -1883,7 +1888,7 @@ class ArcToolApp:
         self.main_paned_window = ttk.PanedWindow(root, orient=tk.VERTICAL, style='TPanedwindow'); self.main_paned_window.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         # Top Pane for controls
-        self.top_pane_frame = ttk.Frame(self.main_paned_window, style='TFrame'); self.main_paned_window.add(self.top_pane_frame, weight=3) # Give more weight to top
+        self.top_pane_frame = ttk.Frame(self.main_paned_window, style='TFrame'); self.main_paned_window.add(self.top_pane_frame, weight=3)
 
         # Header and Help Button
         header_frame = ttk.Frame(self.top_pane_frame, style='TFrame'); 
@@ -1895,45 +1900,34 @@ class ArcToolApp:
         ttk.Label(self.top_pane_frame, 
                   text=attribution_text, 
                   style='TLabel', 
-                  font=self.tab_label_font).pack(anchor='w', pady=(0, 10), padx=10) # Added line break for readability
-
-        self.notebook = ttk.Notebook(self.top_pane_frame, style='TNotebook')
+                  font=self.tab_label_font).pack(anchor='w', pady=(0, 10), padx=10)
 
         self.notebook = ttk.Notebook(self.top_pane_frame, style='TNotebook')
         self.list_extract_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
         self.list_inject_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
         self.rec_extract_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
         self.folder_inject_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
-        self.flatten_extract_frame = ttk.Frame(self.notebook, style='TFrame', padding=10) # New Tab 1
-        self.internal_arc_extract_frame = ttk.Frame(self.notebook, style='TFrame', padding=10) # New Tab 2
+        self.flatten_extract_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
+        self.internal_arc_extract_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
 
         self.notebook.add(self.list_extract_frame, text='Extract Arc Files')
         self.notebook.add(self.list_inject_frame, text='Inject Arc Folders')
         self.notebook.add(self.rec_extract_frame, text='Recursive Extract')
         self.notebook.add(self.folder_inject_frame, text='Recursive Inject (In-Place)')
-        self.notebook.add(self.flatten_extract_frame, text='Extract All (Flatten)') # New Tab 1
-        self.notebook.add(self.internal_arc_extract_frame, text='Internal-ARC Extraction') # New Tab 2
+        self.notebook.add(self.flatten_extract_frame, text='Extract All (Flatten)')
+        self.notebook.add(self.internal_arc_extract_frame, text='Internal-ARC Extraction')
 
         self.notebook.pack(pady=5, padx=10, expand=True, fill='both')
 
         self.create_list_extract_widgets(); self.create_list_inject_widgets(); self.create_recursive_extract_widgets(); self.create_folder_inject_widgets()
-        self.create_flatten_extract_widgets() # New Tab 1
-        self.create_internal_arc_extract_widgets() # New Tab 2
+        self.create_flatten_extract_widgets()
+        self.create_internal_arc_extract_widgets()
 
         # Bottom Pane for status and progress
         self.bottom_pane_frame = ttk.Frame(self.main_paned_window, style='TFrame');
         self.main_paned_window.add(self.bottom_pane_frame, weight=1)
 
-        #log_button_frame = ttk.Frame(self.bottom_pane_frame, style='TFrame');
-        #log_button_frame.pack(fill=tk.X, pady=(5,0), padx=10)
-        #self.pop_log_button = ttk.Button(log_button_frame, text="↗ Pop Out Log", command=self.toggle_pop_out_log)
-        #self.pop_log_button.pack(side=tk.RIGHT)
-        #self.log_is_popped_out = False
-        #self.log_toplevel_window = None
-
-
         self.status_frame = ttk.Frame(self.bottom_pane_frame, style='Status.TFrame');
-
         self.status_frame.pack(pady=(0,0), padx=10, fill='both', expand=True, side=tk.TOP);
         self.status_frame.grid_rowconfigure(0, weight=1);
         self.status_frame.grid_columnconfigure(0, weight=1)
@@ -1950,10 +1944,16 @@ class ArcToolApp:
 
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(self.bottom_pane_frame, orient='horizontal', length=100, mode='determinate', variable=self.progress_var, style='TProgressbar');
-        self.progress_bar.pack(pady=10, padx=10, fill='x', side=tk.BOTTOM) # More padding
+        self.progress_bar.pack(pady=10, padx=10, fill='x', side=tk.BOTTOM)
 
-        self.current_arc_for_internal_view = None # For Internal-ARC Extraction tab
-        self.tree_item_data = {} # To store file_info for tree items in Internal-ARC Extraction
+        self.current_arc_for_internal_view = None 
+        self.tree_item_data = {} 
+
+        # MODIFIED: Moved Drag and Drop setup to after all widgets are created
+        if TkinterDnD:
+            self.setup_drag_and_drop()
+        else:
+            self.add_status_message("tkinterdnd2 library not found. Drag and drop functionality will be disabled.", STATUS_WARN)
 
         self.check_queue()
 
@@ -2022,11 +2022,10 @@ class ArcToolApp:
     def create_internal_arc_extract_widgets(self):
         frame = self.internal_arc_extract_frame
         frame.grid_columnconfigure(0, weight=1)
-        # MODIFIED: Configure row 1 (treeview's row) to expand, not row 2
         frame.grid_rowconfigure(1, weight=1)
 
         # Top: ARC file selection
-        input_arc_frame = ttk.Frame(frame); input_arc_frame.grid(row=0, column=0, sticky='ew', padx=5, pady=(0,2)) # Added bottom pady
+        input_arc_frame = ttk.Frame(frame); input_arc_frame.grid(row=0, column=0, sticky='ew', padx=5, pady=(0,2))
         input_arc_frame.grid_columnconfigure(0, weight=1)
         ttk.Label(input_arc_frame, text="Select ARC File to Preview:", style='Header.TLabel').pack(side=tk.LEFT, anchor='w')
         self.internal_arc_filepath_var = tk.StringVar()
@@ -2035,9 +2034,8 @@ class ArcToolApp:
 
         # Middle: Treeview
         tree_frame = ttk.Frame(frame);
-        # MODIFIED: Added pady=(2,0) for padding above tree_frame
         tree_frame.grid(row=1, column=0, sticky='nsew', pady=(2,0))
-        tree_frame.grid_rowconfigure(0, minsize=250,  weight=1); # Reduced minsize a bit for overall height reduction
+        tree_frame.grid_rowconfigure(0, minsize=250,  weight=1); 
         tree_frame.grid_columnconfigure(0, weight=1, minsize=200)
 
         self.internal_arc_tree = ttk.Treeview(tree_frame, columns=("fullpath", "type", "size"), displaycolumns=(), show="tree")
@@ -2058,19 +2056,117 @@ class ArcToolApp:
         self.internal_arc_tree.tag_configure('folder_checked_color', foreground='#00f7ff')
         self.internal_arc_tree.tag_configure('file_unchecked_color', foreground=TEXT_COLOR)
         self.internal_arc_tree.tag_configure('folder_unchecked_color', foreground='#FFDEAD')
-
-        #self.internal_arc_tree.tag_configure('file', foreground=TEXT_COLOR)
-        #self.internal_arc_tree.tag_configure('folder', foreground='#FFDEAD')
-        #self.internal_arc_tree.tag_configure('checked_item_yellow', foreground='#FFFF00') # Yellow for checked items
         self.internal_arc_tree.bind("<ButtonRelease-1>", self.on_tree_item_toggle_check)
 
         # Bottom: Output dir and Extract button
         output_frame = ttk.Frame(frame);
-        # MODIFIED: Added pady=(2,0) for padding between treeview and output_frame (the "sticky" part)
         output_frame.grid(row=2, column=0, sticky='ews', pady=(2,0))
         self._create_dir_input(output_frame, "Output Directory for Selected Items:", 0, "internal_extract_output_var")
         ttk.Button(frame, text="Extract Selected Items", command=self.start_internal_arc_extraction).grid(row=3, column=0, pady=(10,10), padx=5)
 
+    # --- ADDED: Drag and Drop Setup and Handlers ---
+    def setup_drag_and_drop(self):
+        # Tab 1: Extract Arc Files (List) - Target: Listbox
+        self.list_extract_listbox.drop_target_register(DND_FILES)
+        self.list_extract_listbox.dnd_bind('<<Drop>>', self.handle_drop_list_extract)
+
+        # Tab 5: Extract All (Flatten) - Target: Whole tab frame
+        self.flatten_extract_frame.drop_target_register(DND_FILES)
+        self.flatten_extract_frame.dnd_bind('<<Drop>>', self.handle_drop_flatten_extract)
+
+        # Tab 6: Internal-ARC Extraction - Target: Whole tab frame
+        self.internal_arc_extract_frame.drop_target_register(DND_FILES)
+        self.internal_arc_extract_frame.dnd_bind('<<Drop>>', self.handle_drop_internal_arc)
+        self.add_status_message("Drag and drop initialized for relevant tabs.", STATUS_DEBUG)
+
+    def _parse_dropped_files(self, event_data_str):
+        # tkinterdnd2 passes a string that might be a tcl list
+        # self.root.tk.splitlist is the robust way to parse it
+        try:
+            filepaths = self.root.tk.splitlist(event_data_str)
+            return [pathlib.Path(fp) for fp in filepaths]
+        except Exception as e:
+            self.add_status_message(f"Error parsing dropped file list: {e}", STATUS_ERROR)
+            return []
+
+    def handle_drop_list_extract(self, event):
+        try:
+            filepaths = self._parse_dropped_files(event.data)
+            current_items = set(self.list_extract_listbox.get(0, tk.END))
+            new_files_added_count = 0
+            for fp in filepaths:
+                if fp.is_file() and fp.suffix.lower() == '.arc':
+                    fp_str = str(fp)
+                    if fp_str not in current_items:
+                        self.list_extract_listbox.insert(tk.END, fp_str)
+                        new_files_added_count += 1
+            
+            if new_files_added_count > 0:
+                self.add_status_message(f"D&D: Added {new_files_added_count} ARC file(s) to 'Extract Arc Files' list.", STATUS_INFO)
+            elif not any(fp.suffix.lower() == '.arc' for fp in filepaths):
+                 self.add_status_message("D&D: No .arc files found in dropped items for 'Extract Arc Files'.", STATUS_WARN)
+            self.notebook.select(self.list_extract_frame) # Switch to the tab
+        except Exception as e:
+            self.add_status_message(f"Error during D&D for List Extract: {e}", STATUS_ERROR)
+            traceback.print_exc(file=sys.stderr)
+
+    def handle_drop_flatten_extract(self, event):
+        try:
+            filepaths = self._parse_dropped_files(event.data)
+            dropped_arc_file_path = None
+            for fp in filepaths:
+                if fp.is_file() and fp.suffix.lower() == '.arc':
+                    dropped_arc_file_path = str(fp)
+                    break # Take the first valid .arc file
+
+            if not dropped_arc_file_path:
+                self.add_status_message("D&D: No .arc file dropped or found for 'Extract All (Flatten)'.", STATUS_WARN)
+                return
+
+            output_dir = self.flatten_extract_output_var.get()
+            if not output_dir:
+                messagebox.showwarning("Output Missing", "Please select an output directory for the flattened files before dropping an ARC.")
+                self.add_status_message("D&D Flatten: Output directory not set.", STATUS_ERROR)
+                return
+            
+            if not pathlib.Path(output_dir).is_dir():
+                try:
+                    pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
+                except Exception as e_mkdir:
+                    messagebox.showerror("Output Error", f"Cannot create output directory '{output_dir}': {e_mkdir}")
+                    self.add_status_message(f"D&D Flatten: Error creating output dir: {e_mkdir}", STATUS_ERROR)
+                    return
+
+            self.add_status_message(f"D&D Flatten: Processing '{os.path.basename(dropped_arc_file_path)}' into '{output_dir}'.", STATUS_INFO)
+            # Use run_batch_parallel with _flatten_extract_worker for a single file
+            self._run_task(run_batch_parallel, 
+                           args_tuple=(_flatten_extract_worker, [dropped_arc_file_path], output_dir))
+            self.notebook.select(self.flatten_extract_frame) # Switch to the tab
+        except Exception as e:
+            self.add_status_message(f"Error during D&D for Flatten Extract: {e}", STATUS_ERROR)
+            traceback.print_exc(file=sys.stderr)
+
+    def handle_drop_internal_arc(self, event):
+        try:
+            filepaths = self._parse_dropped_files(event.data)
+            dropped_arc_file_path = None
+            for fp in filepaths:
+                if fp.is_file() and fp.suffix.lower() == '.arc':
+                    dropped_arc_file_path = str(fp)
+                    break # Take the first valid .arc file
+            
+            if not dropped_arc_file_path:
+                self.add_status_message("D&D: No .arc file dropped or found for 'Internal-ARC Extraction'.", STATUS_WARN)
+                return
+
+            self.internal_arc_filepath_var.set(dropped_arc_file_path)
+            self.load_arc_into_treeview(dropped_arc_file_path)
+            self.add_status_message(f"D&D: Loaded '{os.path.basename(dropped_arc_file_path)}' for internal preview.", STATUS_INFO)
+            self.notebook.select(self.internal_arc_extract_frame) # Switch to the tab
+        except Exception as e:
+            self.add_status_message(f"Error during D&D for Internal ARC: {e}", STATUS_ERROR)
+            traceback.print_exc(file=sys.stderr)
+    # --- End ADDED Drag and Drop ---
 
     def select_list_extract_files(self):
         files=filedialog.askopenfilenames(title="Select ARC Files", filetypes=[("MT ARC","*.arc"),("All Files","*.*")]);
@@ -2100,54 +2196,53 @@ class ArcToolApp:
         self.tree_item_data.clear()
         self.current_arc_for_internal_view = MTArc()
         try:
+            # For loading via UI, always pass the app's status queue
             self.current_arc_for_internal_view.load(filepath, status_queue=self.queue)
-            # ... (status message) ...
+            self.add_status_message(f"Loaded ARC '{os.path.basename(filepath)}' with {len(self.current_arc_for_internal_view.files)} entries.", STATUS_INFO)
             
             folder_iids = {}
+            # Sort files by full path to ensure parent folders are created before their children
             sorted_files = sorted(self.current_arc_for_internal_view.files, key=lambda fi: fi['full_filename'].replace('\\', '/'))
 
             for file_info in sorted_files:
-                full_path = file_info['full_filename'].replace('\\', '/')
+                full_path = file_info['full_filename'].replace('\\', '/') # Normalize separators
                 parts = full_path.split('/')
-                current_parent_iid_for_insert = '' # This is key for insert's parent arg
+                current_parent_iid_for_insert = '' 
                 path_accumulator = []
 
-                for i, part_name in enumerate(parts[:-1]): 
+                # Create/find parent folder IIDs
+                for i, part_name in enumerate(parts[:-1]): # Iterate through folder parts
                     path_accumulator.append(part_name)
                     current_folder_path_str = "/".join(path_accumulator)
                     
                     if current_folder_path_str not in folder_iids:
                         # Insert the folder item
-                        # The first argument to insert() is the parent_iid.
-                        # For top-level folders, current_parent_iid_for_insert is ''
                         iid = self.internal_arc_tree.insert(
-                            current_parent_iid_for_insert, # Parent for this new item
+                            current_parent_iid_for_insert, 
                             'end', 
                             text=f"{CHECK_UNCHECKED} {part_name}", 
-                            # values are for your data, not directly for visual structure
                             values=(current_folder_path_str, "folder", 0), 
-                            tags=('folder_unchecked_color',), # Initial tag for color
+                            tags=('folder_unchecked_color',), 
                             open=False
                         )
                         folder_iids[current_folder_path_str] = iid
                         self.tree_item_data[iid] = {
                             'path': current_folder_path_str, 'is_folder': True, 
                             'checked_state': False, 'file_info': None,
-                            'display_name': part_name
+                            'display_name': part_name 
                         }
-                        current_parent_iid_for_insert = iid # Next item in this path will be child of this
+                        current_parent_iid_for_insert = iid 
                     else:
                         current_parent_iid_for_insert = folder_iids[current_folder_path_str]
                 
-                file_name_only = parts[-1]
                 # Insert the file item
-                # current_parent_iid_for_insert is now the iid of the immediate parent folder (or '' if top-level file)
+                file_name_only = parts[-1]
                 file_iid = self.internal_arc_tree.insert(
-                    current_parent_iid_for_insert, # Parent for this new item
+                    current_parent_iid_for_insert, 
                     'end',
                     text=f"{CHECK_UNCHECKED} {file_name_only}",
                     values=(full_path, "file", file_info.get('calculated_uncompressed_size',0)),
-                    tags=('file_unchecked_color',), # Initial tag for color
+                    tags=('file_unchecked_color',), 
                     open=False
                 )
                 self.tree_item_data[file_iid] = {
@@ -2168,24 +2263,16 @@ class ArcToolApp:
         if not item_iid:
             return
 
-        # Identify the specific element clicked within the tree item
         element_clicked = self.internal_arc_tree.identify_element(event.x, event.y)
-        # For debugging: self.add_status_message(f"Tree Element: {element_clicked}, Item: {item_iid}", STATUS_DEBUG)
-
-        # If the click was on the expander/indicator, do not toggle the checkbox.
-        # Check for common substrings associated with the expander element.
-        # ttk themes might name these differently (e.g., 'Treeitem.indicator', 'arrow', etc.)
         element_str_lower = str(element_clicked).lower()
         if "indicator" in element_str_lower or \
            "expander" in element_str_lower or \
            "arrow" in element_str_lower:
-            # self.add_status_message(f"Expander click on {item_iid}. No toggle.", STATUS_DEBUG) # For debugging
-            return # Allow default expand/collapse to happen without toggling checkbox
+            return 
 
         if item_iid not in self.tree_item_data:
             return
 
-        # Proceed to toggle checkbox state if not an expander click
         current_data = self.tree_item_data[item_iid]
         new_state = not current_data['checked_state']
         self._set_tree_item_checked_state(item_iid, new_state, recursive=True, update_parent=True)
@@ -2242,11 +2329,11 @@ class ArcToolApp:
         parent_data = self.tree_item_data[parent_iid]
         current_parent_checked_state = parent_data['checked_state']
 
-        if not children_iids: # Parent has no children, its state is independent
+        if not children_iids: 
             return
 
         all_children_now_fully_checked = True
-        any_child_checked = False # To see if we need to go to a 'partially checked' state if implemented
+        any_child_checked = False 
 
         for child_iid in children_iids:
             if child_iid in self.tree_item_data:
@@ -2255,34 +2342,19 @@ class ArcToolApp:
                     all_children_now_fully_checked = False
                 if child_data['checked_state']:
                     any_child_checked = True
-            else: # Should not happen, child not in data
+            else: 
                 all_children_now_fully_checked = False 
         
-        new_parent_checked_state = current_parent_checked_state # Default to no change
+        new_parent_checked_state = current_parent_checked_state 
 
-        # Logic:
-        # 1. If parent was checked, and now NOT all children are checked -> parent becomes unchecked.
-        # 2. If parent was checked, and ALL children are still checked -> parent stays checked (no change from default).
-        # 3. If parent was UNCHECKED, and now ALL children are checked -> parent STAYS UNCHECKED (this is the key change).
-        # 4. If parent was UNCHECKED, and NOT all children are checked (some or none) -> parent STAYS UNCHECKED (no change from default).
-
-        if current_parent_checked_state: # If parent was previously checked
+        if current_parent_checked_state: 
             if not all_children_now_fully_checked:
-                new_parent_checked_state = False # Uncheck the parent
-            # Else (all children are still checked), parent remains checked (no change needed as new_parent_checked_state is already True)
-        else: # Parent was previously unchecked
-            # It remains unchecked regardless of children's state, unless it's explicitly clicked by the user.
-            # The scenario "parent was UNCHECKED, and now ALL children are checked" should NOT cause the parent to become checked.
-            pass # new_parent_checked_state remains False.
+                new_parent_checked_state = False 
+        else: 
+            pass 
             
-
         if current_parent_checked_state != new_parent_checked_state:
-            # self.add_status_message(f"Debug: Parent {parent_iid} checkbox changing from {current_parent_checked_state} to {new_parent_checked_state}", STATUS_DEBUG)
-            # The recursive=False here is important to prevent re-triggering child updates unnecessarily from this parent update.
-            # The color update will happen via this call.
             self._set_tree_item_checked_state(parent_iid, new_parent_checked_state, recursive=False, update_parent=True)
-        # else:
-            # self.add_status_message(f"Debug: Parent {parent_iid} checkbox NO change from {current_parent_checked_state}", STATUS_DEBUG)
 
     def _run_task(self, target_func, args_tuple=(), kwargs_dict=None,
                   original_arc_params_list=None,
@@ -2309,7 +2381,7 @@ class ArcToolApp:
         self.progress_var.set(0)
 
         task_name_display = target_func.__name__.replace('_', ' ').replace('run batch parallel', '').strip().title()
-        if args_tuple and hasattr(args_tuple[0], '__name__'):
+        if args_tuple and hasattr(args_tuple[0], '__name__'): # Check if first arg is a function (worker)
             worker_name = args_tuple[0].__name__
             if worker_name == '_list_extract_worker': task_name_display = "List Extraction"
             elif worker_name == '_list_inject_worker': task_name_display = "List Injection"
@@ -2532,7 +2604,8 @@ class ArcToolApp:
             status_callback(f"Re-opening ARC '{os.path.basename(arc_filepath_str)}' for extraction...", STATUS_DEBUG)
             arc_for_extraction = MTArc()
             try:
-                arc_for_extraction.load(arc_filepath_str, key1=key1, key2=key2, status_queue=self.queue)
+                # For threaded extraction, pass the thread's status_callback (which queues to main GUI)
+                arc_for_extraction.load(arc_filepath_str, key1=key1, key2=key2, status_queue=self.queue) # Use self.queue for MTArc's load logs
             except Exception as e:
                 status_callback(f"Failed to re-open ARC '{os.path.basename(arc_filepath_str)}': {e}", STATUS_ERROR)
                 progress_callback(100) # End progress
@@ -2672,17 +2745,12 @@ class ArcToolApp:
 
     def show_help(self):
         help_text_content = """
-        SaladSoftware MT Framework Arc Tool - Help
-
-        General Notes:
-        - ARCC files (encrypted ARCs) use default keys unless custom keys are implemented/prompted for.
-        - Operations involving multiple files run in parallel for speed.
-        - Status messages appear in the bottom panel with timestamps.
-
+        SaladSoftware MT Framework Arc Tool - Help Section
+        buh
         Tab Descriptions:
 
         1. Extract Arc Files (List):
-           - Select one or more .arc files.
+           - Select one or more .arc files (or drag & drop).
            - Each ARC is extracted into its own subfolder (e.g., 'file.arc' extracts to 'file_arc/').
            - The internal folder structure of each ARC is preserved within its output subfolder.
            - Output folders are created next to their respective input .arc files.
@@ -2690,54 +2758,60 @@ class ArcToolApp:
         2. Inject Arc Folders (List):
            - Add one or more source folders to the list. These folders contain files you want to pack into ARCs.
            - Select an output directory where the new .arc files will be saved.
-           - Each source folder is rebuilt into a new .arc file (e.g., 'my_mod_folder' becomes 'my_mod_folder.arc').
-           - If a folder is named 'myarc_arc' and 'myarc.arc' exists in the same directory, parameters (version, platform, file order, etc.) from 'myarc.arc' will be used for the rebuild. Otherwise, default parameters (typically Switch v9, Little Endian) are used.
+           - Each source folder is rebuilt into a new .arc file ('hotdog' becomes 'hotdog.arc').
+           - If a folder is named 'myarc_arc' and 'myarc.arc' exists in the same directory, 
+           parameters (version, platform, file order, etc.) from 'myarc.arc' will be used for the rebuild. 
+           - Otherwise, default parameters are used.
 
         3. Recursive Extract Arcs:
            - Select a root directory.
            - The tool will scan this directory and all its subdirectories for .arc files.
-           - Each found .arc file is extracted similarly to 'Extract Arc Files (List)' (into its own subfolder, next to the ARC).
+           - Each found .arc file is extracted similarly to 'Extract Arc Files (List)' 
+           (into its own subfolder, next to the ARC).
 
         4. Recursive Inject (In-Place):
-           - Select a root directory that contains both original .arc files and corresponding unpacked/edited folders (typically named 'original_arc_name_arc').
+           - Select a root directory that contains both original .arc files and 
+           corresponding unpacked/edited folders (typically named 'original_arc_name_arc').
            - The tool matches *_arc folders with their .arc files.
            - Original .arc files are backed up into an 'original_arc_backups' subfolder (created within the selected root directory).
            - The *_arc folders are then rebuilt into .arc files, replacing the originals.
-           - This process attempts to use the *exact parameters* (version, platform, byte order, ARCC status, file order, compression hints) from the original ARC for the rebuild.
+           - This process attempts to use the (version, platform, byte order, ARCC status, 
+           file order, compression hints) from the original ARC for the rebuild.
            - Processed *_arc folders are also moved to the backup directory.
 
         5. Extract All (Flatten File Struct):
-           - Select a root directory containing .arc files (scanned recursively).
+           - Select a root directory containing .arc files (scanned recursively) using "Browse" and "Start".
+           - OR Drag & Drop a single .arc file onto this tab.
            - Select a single output directory.
-           - All files from all found ARCs are extracted directly into this single output directory.
+           - All files from all found ARCs (recursive) or the single dropped ARC are extracted directly into this single output directory.
            - The original folder structure *within* the ARCs is discarded (flattened).
-           - To prevent name collisions, extracted filenames are prefixed with the name of their source ARC (e.g., 'arc1_image.tex', 'arc2_sound.wav').
+           - To prevent name collisions, extracted filenames are prefixed with the name of their source ARC 
+           (e.g., 'arc1_image.tex', 'arc2_sound.wav').
 
         6. Internal-ARC Extraction:
-           - Select a single .arc file to load and preview its internal file/folder structure in a tree view.
+           - Select a single .arc file to load (or drag & drop) and preview its internal file/folder structure in a tree view.
            - Check the boxes next to individual files or folders within the tree that you wish to extract.
              - Checking a folder will effectively check all its contents.
            - Select an output directory.
            - Click "Extract Selected Items".
              - If a file is checked, it's saved to: `output_dir/filename.ext`
-             - If a folder (e.g., 'textures/player') is checked, its contents are saved to: `output_dir/player/content_file.ext`, preserving the structure *relative to the checked folder*.
+             - If a folder (e.g., 'textures/player') is checked, its contents are saved to: 
+             `output_dir/player/content_file.ext`.
         """
-        # MODIFIED: Create custom Toplevel for help
         help_win = tk.Toplevel(self.root)
         help_win.title("Help - SaladSoftware ARC Tool")
         help_win.configure(bg=BG_COLOR)
-        help_win.geometry("750x650") # Adjusted size for readability
+        help_win.geometry("1200x900")
 
         help_win.grid_rowconfigure(0, weight=1)
         help_win.grid_columnconfigure(0, weight=1)
 
-        # Create a frame for text and button to manage padding
         content_frame = ttk.Frame(help_win, style='TFrame', padding=10)
         content_frame.grid(row=0, column=0, sticky='nsew')
         content_frame.grid_rowconfigure(0, weight=1)
         content_frame.grid_columnconfigure(0, weight=1)
 
-        help_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE + 2)
+        help_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE-1) # Use app's font settings
         help_text_widget = scrolledtext.ScrolledText(
             content_frame,
             wrap=tk.WORD,
@@ -2746,10 +2820,10 @@ class ArcToolApp:
             fg=TEXT_COLOR,
             bd=1,
             relief='sunken',
-            padx=5, # Internal padding for text
+            padx=5,
             pady=5
         )
-        help_text_widget.grid(row=0, column=0, sticky='nsew', pady=(0,10)) # Space below text, before button
+        help_text_widget.grid(row=0, column=0, sticky='nsew', pady=(0,10))
 
         dedented_help_text = textwrap.dedent(help_text_content.strip())
         help_text_widget.insert(tk.END, dedented_help_text)
@@ -2766,10 +2840,24 @@ class ArcToolApp:
         help_win.grab_set()
         help_win.protocol("WM_DELETE_WINDOW", _close_help)
         help_win.focus_set()
-        ok_button.focus_set() # Set focus to OK button
+        ok_button.focus_set()
 
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
+    if TkinterDnD is None:
+        try:
+            temp_root_dnd_err = tk.Tk()
+            temp_root_dnd_err.withdraw()
+            messagebox.showerror("Dependency Missing",
+                                 "Required 'tkinterdnd2' library not found for drag & drop.\n"
+                                 "Please install it (e.g., pip install tkinterdnd2).\n"
+                                 "The application will run without drag & drop support.")
+            temp_root_dnd_err.destroy()
+        except tk.TclError:
+             print("ERROR: tkinterdnd2 library not found AND Tkinter is not available for dialog.\n"
+                   "Please install it (e.g., pip install tkinterdnd2).\n"
+                   "Drag & drop will be disabled.", file=sys.stderr)
+
     try:
         _ = Blowfish.new(b"12345678", Blowfish.MODE_ECB)
     except ImportError:
@@ -2793,7 +2881,6 @@ if __name__ == "__main__":
     game_specific_map_path = resource_path(GAME_SPECIFIC_HASH_FILE)
 
     if not os.path.exists(primary_extension_map_path):
-        # Adjusted warning message to be more generic about file location
         warning_msg = (f"Primary extension map file '{EXTENSION_MAP_FILE}' not found where expected.\n"
                        "It should be bundled with the application or in the same directory as the script if run directly.\n"
                        "Extracted files might have generic hexadecimal extensions (e.g., .1234ABCD) instead of meaningful ones (e.g., .tex).")
@@ -2806,6 +2893,10 @@ if __name__ == "__main__":
 
     load_extension_map(primary_extension_map_path, game_specific_map_path)
 
-    root = tk.Tk()
+    if TkinterDnD:
+        root = TkinterDnD.Tk()
+    else:
+        root = tk.Tk()
+        
     app = ArcToolApp(root)
     root.mainloop()
