@@ -55,6 +55,58 @@ SaladSoftware uses Kuriimu (1) Karameru C# code, but uses python instead. Origin
              - If a file is checked, it's saved to: `output_dir/filename.ext`
              - If a folder (e.g., 'textures/player') is checked, its contents are saved to: `output_dir/player/content_file.ext`, preserving the structure *relative to the checked folder*.
 
+## CLI Usage
+Usage: python your_script_name.py [command] [options]
+
+General Notes:
+  - Use -h or --help with any command for full details (e.g., python your_script_name.py extract -h).
+  - ARCC files are skipped; encryption keys (--key1, --key2) are present but unused.
+
+Commands:
+
+1. extract <ARC_FILE...>
+   - Extracts one or more .arc files.
+   - Output: Folder <filename>_arc created next to each input .arc.
+   - Example: python your_script_name.py extract myarchive.arc another.arc
+
+2. inject <FOLDER...> -o <OUTPUT_DIR>
+   - Rebuilds ARC(s) from source folder(s).
+   - Output: New .arc files in specified <OUTPUT_DIR>.
+   - If <FOLDER> is named 'name_arc' and 'name.arc' exists alongside, its parameters (version, platform, file order etc.) are used for rebuild. Otherwise, defaults apply.
+   - Example: python your_script_name.py inject ./myfiles_arc ./otherfiles_arc -o ./rebuilt_arcs
+
+3. extract-recursive <SOURCE_DIR>
+   - Recursively finds all .arc files in <SOURCE_DIR> and extracts them.
+   - Output: Like 'extract', <filename>_arc folders next to each found .arc.
+   - Example: python your_script_name.py extract-recursive ./game_assets
+
+4. inject-recursive <SOURCE_DIR>
+   - In-place recursive rebuild. Scans <SOURCE_DIR> for .arc files and matching *_arc folders.
+   - Original .arc files are backed up to 'original_arc_backups/' within <SOURCE_DIR>.
+   - Rebuilds using original ARC parameters (version, platform, file order, compression hints).
+   - Processed *_arc folders are also moved to backups.
+   - Example: python your_script_name.py inject-recursive ./modding_project
+
+5. extract-flat <SOURCE_PATH> -o <OUTPUT_DIR>
+   - Extracts all files from all ARCs found in <SOURCE_PATH> (can be a single .arc file or a directory to scan recursively).
+   - Output: All files go into a single <OUTPUT_DIR>, flattened.
+   - Filenames prefixed to avoid collision: arcname_internalfilename.ext.
+   - Example (single ARC): python your_script_name.py extract-flat ./data.arc -o ./all_extracted_flat
+   - Example (directory): python your_script_name.py extract-flat ./arc_folder -o ./all_extracted_flat
+
+6. extract-internal <ARC_FILE> --items <INTERNAL_PATH...> -o <OUTPUT_DIR>
+   - Extracts specific files/folders from within <ARC_FILE> to <OUTPUT_DIR>.
+   - Preserves the specified internal path structure in the output.
+   - --items: Space-separated list of full internal paths (e.g., "path/to/file.tex" "another/folder").
+   - Example: python your_script_name.py extract-internal game.arc --items "ui/tex/button.tex" "char/model/body.mdl" -o ./specific_extract
+
+7. inject-internal <ARC_FILE> --replace <INTERNAL=DISK...> -o <OUTPUT_ARC>
+   - Rebuilds <ARC_FILE> to a new <OUTPUT_ARC>, replacing specified internal files.
+   - --replace: 'internal/path/in/arc=path/to/your/diskfile'. Use multiple times for multiple replacements.
+   - Retains original ARC structure, metadata, and file order for non-replaced files.
+   - --force-repack: Rebuilds even if no --replace arguments are given.
+   - Example: python your_script_name.py inject-internal original.arc --replace "textures/old.tex=./new_texture.tex" --replace "sounds/beep.wav=./boop.wav" -o ./modded.arc
+
 
 ## Compiling
 
