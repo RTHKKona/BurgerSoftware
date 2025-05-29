@@ -3,7 +3,7 @@
 # Kuriimu2 has a GPL-3.0 license, and this script is intended for strictly personal use.
 # It is designed to process and extract files from MT Framework ARC archives.
 # The script includes various utility functions, a GUI for user interaction, and support for Blowfish encryption/decryption.
-# Version 1.3.4
+VERSION = "1.3.6" # Updated for CLI addition
 # Updated 2025-05-25
 
 
@@ -27,6 +27,7 @@ from datetime import datetime # For timestamps
 import shutil # For moving files/folders
 import re # For improved filename sanitization
 import textwrap # Added for help dialog formatting
+import argparse # ADDED: For CLI
 
 # ADDED: For Drag and Drop
 try:
@@ -66,7 +67,7 @@ FMT_HFS_HEADER="4shhiI"; SIZE_HFS_HEADER=16; FMT_HFS_FOOTER="QQ"; SIZE_HFS_FOOTE
 # --- Zlib/Align/Magic ---
 ZLIB_COMPRESSION_LEVEL = 9; ALIGNMENT_SWITCH = 0x8000; ALIGNMENT_PC_DEFAULT = 0x100
 ALIGNMENT_PC_V7_V10_LE = 0x8000 # For PC Little Endian Version 7 and 0x10 (16)
-MAGIC_ARC_LE=b'ARC\x00'; # ARCC_REMOVED: MAGIC_ARCC_LE=b'ARCC'; 
+MAGIC_ARC_LE=b'ARC\x00'; # ARCC_REMOVED: MAGIC_ARCC_LE=b'ARCC';
 MAGIC_ARC_BE=b'\x00CRA'; MAGIC_HFS_LE=b'HFS\x00'; MAGIC_HFS_BE=b'\x00SFH'
 # --- Status Levels ---
 STATUS_INFO="info"; STATUS_SUCCESS="success"; STATUS_WARN="warn"; STATUS_ERROR="error"; STATUS_DEBUG="debug"
@@ -131,6 +132,7 @@ def load_extension_map(primary_filepath: str, game_specific_filepath: str | None
 
     # --- Load Primary Extension File ---
     if not os.path.isfile(primary_filepath):
+        # This function might be called before GUI/CLI choice, so use print for now.
         print(f"Warning: Primary extension map file not found at '{primary_filepath}'. Using empty map initially.", file=sys.stderr)
     else:
         potential_hashes_from_primary_file = set()
@@ -521,14 +523,19 @@ class MTArc:
     # ARCC_REMOVED:         self.is_encrypted=False; self.crypto=None
 
 
-    def load(self, filepath, key1=None, key2=None, status_queue=None):
+    def load(self, filepath, key1=None, key2=None, status_queue_or_callback=None): # MODIFIED: status_queue -> status_queue_or_callback
         self.files = []; self._raw_file_path = None; self._decrypted_entries_bytes = None; self._data_offset = 0; self._file_size = None
         self.hfs_header = None; self.hfs_footer = None; self.arc_header = None
         self.hfs_disk_header_length = 0;
         self.entry_has_extended_names = False
-        
-        _q_status_actual = lambda msg, level: print(f"NO_QUEUE [{level.upper()}]: {msg}", file=sys.stderr)
-        if status_queue: _q_status_actual = lambda msg, level: status_queue.put({'type':'status','msg':msg,'level':level})
+
+        # ADAPTED: Handle both queue and callback for status
+        _q_status_actual = lambda msg, level: print(f"NO_CALLBACK [{level.upper()}]: {msg}", file=sys.stderr)
+        if status_queue_or_callback:
+            if hasattr(status_queue_or_callback, 'put') and callable(status_queue_or_callback.put): # It's a queue
+                _q_status_actual = lambda msg, level: status_queue_or_callback.put({'type':'status','msg':msg,'level':level})
+            elif callable(status_queue_or_callback): # It's a direct callback
+                _q_status_actual = status_queue_or_callback
         _q_status = _q_status_actual
 
         # ARCC_SKIP: Explicitly check for ARCC magic at the very beginning
@@ -537,9 +544,9 @@ class MTArc:
                 magic_peek = f_peek_magic.read(4)
             if magic_peek == b'ARCC': # Direct check for ARCC magic
                 skip_msg = f"Skipped .arcc file: '{os.path.basename(filepath)}'. This tool does not process encrypted ARCC files."
-                _q_status(skip_msg, STATUS_INFO) 
+                _q_status(skip_msg, STATUS_INFO)
                 raise ARCCSkippedError(skip_msg)
-        except ARCCSkippedError: 
+        except ARCCSkippedError:
             raise
         except Exception as e_peek:
             _q_status(f"Notice: Initial magic peek for '{os.path.basename(filepath)}' encountered an issue ({e_peek}), proceeding with standard load attempt.", STATUS_DEBUG)
@@ -609,7 +616,7 @@ class MTArc:
 
                 self.version = self.arc_header.version
                 _q_status(f"Diag: File '{os.path.basename(filepath)}' - Parsed ARC Header: Magic={self.arc_header.magic!r}, Version={self.version}, EntryCount={self.arc_header.entry_count}", STATUS_DEBUG)
-                
+
                 if self.arc_header.magic not in [MAGIC_ARC_LE, MAGIC_ARC_BE]:
                      _q_status(f"Warning: ARC header magic {self.arc_header.magic!r} is not standard ARC LE/BE.", STATUS_WARN)
 
@@ -638,7 +645,7 @@ class MTArc:
                 if metadata_block_size_expected < 0 : raise ValueError("Invalid metadata size calculation (negative).")
 
                 metadata_source_stream = f_raw
-                
+
                 remaining_file_after_arc_header = self._file_size - f_raw.tell()
                 if remaining_file_after_arc_header < metadata_block_size_expected:
                         _q_status(f"Warning: File is too short for the declared metadata block. Expected {metadata_block_size_expected}b after ARC header, have {remaining_file_after_arc_header}b. Entry parsing may fail or be incomplete.", STATUS_WARN)
@@ -810,7 +817,7 @@ class MTArc:
 
     def save(self, output_path, input_file_infos, key1=None, key2=None,
              target_version=None, target_platform=None, target_byte_order_char=None,
-             target_is_arcc=False, 
+             target_is_arcc=False,
              target_entry_has_extended_names=False):
 
         if not input_file_infos: raise ValueError("No file information provided to save.");
@@ -822,14 +829,14 @@ class MTArc:
         try:
             # ARCC_REMOVED: self.is_arcc = target_is_arcc # ARCC_REMOVED: This will not make it an ARCC.
             self.entry_has_extended_names = target_entry_has_extended_names
-            
+
             self.platform = target_platform if target_platform is not None else DEFAULT_PLATFORM
             self.byte_order_char = target_byte_order_char if target_byte_order_char is not None else DEFAULT_BYTE_ORDER_CHAR
             self.version = target_version if target_version is not None else DEFAULT_VERSION
 
-            self.header_length = SIZE_HEADER_COMMON 
+            self.header_length = SIZE_HEADER_COMMON
             if self.platform == Platform.PC and self.byte_order_char == '<' and self.version not in [7, 8]:
-                 self.header_length += SIZE_HEADER_PC_EXTRA 
+                 self.header_length += SIZE_HEADER_PC_EXTRA
 
             current_entry_struct_format_string = FMT_ENTRY
             current_entry_struct_size_val = SIZE_ENTRY
@@ -849,9 +856,9 @@ class MTArc:
             hfs_disk_header_len_for_save = 0
             arc_content_start_on_disk = 0
 
-            if self.hfs_header: 
-                hfs_disk_header_len_for_save = self.hfs_disk_header_length if self.hfs_disk_header_length > 0 else 0x20000 
-                if self.hfs_header.type == 0x10 and hfs_disk_header_len_for_save != 0x10: 
+            if self.hfs_header:
+                hfs_disk_header_len_for_save = self.hfs_disk_header_length if self.hfs_disk_header_length > 0 else 0x20000
+                if self.hfs_header.type == 0x10 and hfs_disk_header_len_for_save != 0x10:
                      hfs_disk_header_len_for_save = 0x10
                 arc_content_start_on_disk = hfs_disk_header_len_for_save
                 print(f"Diag: Save - HFS header detected. ARC content will start at {arc_content_start_on_disk:#x} (hfs_disk_header_len_for_save).")
@@ -888,8 +895,8 @@ class MTArc:
                 original_raw_u_size_hint = fi_original.get("original_uncompressed_size_raw_hint")
                 if original_raw_u_size_hint is not None and isinstance(original_raw_u_size_hint, int):
                     original_raw_u_size_for_calc = original_raw_u_size_hint
-                else: 
-                    original_raw_u_size_for_calc = 0 
+                else:
+                    original_raw_u_size_for_calc = 0
 
                 uncompressed_size_for_metadata_entry = 0
                 if self.platform == Platform.CTR or (self.platform == Platform.PC and self.byte_order_char == '<'):
@@ -911,28 +918,28 @@ class MTArc:
                     if original_was_compressed_hint is True:
                         attempt_compression = True
                     elif original_was_compressed_hint is False:
-                        attempt_compression = False 
-                    else: 
+                        attempt_compression = False
+                    else:
                         if self.platform == Platform.Switch:
-                            attempt_compression = True 
-                        else: 
+                            attempt_compression = True
+                        else:
                             attempt_compression = True
 
                 if attempt_compression:
                     try:
                         compressed_attempt = compress_kontract_zlib(original_data, level=ZLIB_COMPRESSION_LEVEL)
-                        if original_was_compressed_hint is True: 
+                        if original_was_compressed_hint is True:
                             compressed_data = compressed_attempt
                             is_actually_compressed_for_entry = True
-                        elif self.platform == Platform.Switch: 
+                        elif self.platform == Platform.Switch:
                             compressed_data = compressed_attempt
                             is_actually_compressed_for_entry = True
-                        elif original_was_compressed_hint is None and len(compressed_attempt) < uncompressed_size: 
+                        elif original_was_compressed_hint is None and len(compressed_attempt) < uncompressed_size:
                             compressed_data = compressed_attempt
                             is_actually_compressed_for_entry = True
                     except Exception as e_compress:
                         print(f"ERROR: Zlib compression failed for '{full_fn_display}': {e_compress}. Storing raw data.",file=sys.stderr)
-                        compressed_data = original_data 
+                        compressed_data = original_data
 
                 data_to_write_to_stream = compressed_data
                 # ARCC_REMOVED: Data encryption block for ARCC.
@@ -963,7 +970,7 @@ class MTArc:
                     padding_needed_for_hfs = arc_content_start_on_disk - len(hfs_header_struct_bytes)
                     if padding_needed_for_hfs > 0: f_out.write(b'\x00' * padding_needed_for_hfs)
                     elif padding_needed_for_hfs < 0: raise RuntimeError(f"HFS header (size {len(hfs_header_struct_bytes)}) is larger than allocated HFS disk header space ({arc_content_start_on_disk}).")
-                    f_out.seek(arc_content_start_on_disk) 
+                    f_out.seek(arc_content_start_on_disk)
                     print(f"Diag: Save - Wrote HFS header and padded to ARC content start at {arc_content_start_on_disk:#x}.")
 
                 f_out.write(b'\x00' * self.header_length)
@@ -1018,12 +1025,12 @@ class MTArc:
                 if self.hfs_header and self.hfs_footer:
                     f_out.seek(0, io.SEEK_END)
                     print(f"Diag: Save - Current end of file: {f_out.tell()} bytes. Padding for HFS footer (alignment 16).")
-                    pad_stream(f_out, 16) 
+                    pad_stream(f_out, 16)
                     hfs_footer_struct_bytes = struct.pack(format_struct(self.byte_order_char, FMT_HFS_FOOTER), *self.hfs_footer)
                     f_out.write(hfs_footer_struct_bytes)
                     print(f"Diag: Save - Wrote HFS footer ({len(hfs_footer_struct_bytes)} bytes). New file size: {f_out.tell()} bytes.")
 
-                f_out.seek(arc_content_start_on_disk) 
+                f_out.seek(arc_content_start_on_disk)
                 output_magic_bytes = (MAGIC_ARC_BE if self.byte_order_char == '>' else MAGIC_ARC_LE)
 
 
@@ -1052,19 +1059,20 @@ class MTArc:
     def close(self):
         self.hfs_header = None; self.hfs_footer = None; self.arc_header = None; self.files = []
         self._raw_file_path = None; self._decrypted_entries_bytes = None
-        self.crypto = None; 
+        self.crypto = None;
         self.entry_has_extended_names = False
 
 
 # --- BATCH OPERATIONS (Workers and Orchestrators) ---
-def _list_extract_worker(arc_path_str: str, output_base_dir_str: str | None, key1: str | None, key2: str | None, status_queue: queue.Queue):
+# MODIFIED: status_queue parameter to status_callback_worker
+def _list_extract_worker(arc_path_str: str, output_base_dir_str: str | None, key1: str | None, key2: str | None, status_callback_worker: callable):
     arc_path = pathlib.Path(arc_path_str); arc = None
     try:
         arc_filename = arc_path.name; arc_basename = arc_path.stem
         output_folder = arc_path.parent / f"{arc_basename}_arc"
 
-        status_queue.put({'type': 'status', 'msg': f"Attempting to load {arc_filename}...", 'level': STATUS_DEBUG})
-        arc = MTArc(); arc.load(str(arc_path), key1=key1, key2=key2, status_queue=status_queue)
+        status_callback_worker(f"Attempting to load {arc_filename}...", STATUS_DEBUG)
+        arc = MTArc(); arc.load(str(arc_path), key1=key1, key2=key2, status_queue_or_callback=status_callback_worker)
 
         try: output_folder.mkdir(parents=True, exist_ok=True)
         except Exception as e: raise IOError(f"Failed to create output folder {output_folder}: {e}") from e
@@ -1074,13 +1082,13 @@ def _list_extract_worker(arc_path_str: str, output_base_dir_str: str | None, key
         platform_name = platform_name_map.get(arc.platform, f"PVal {arc.platform}")
 
         relative_output_folder_str = f"./{output_folder.name}"
-        status_queue.put({'type': 'status', 'msg': f" Extracting {len(arc.files)} files from {platform_name} (v{arc.version}, BO:{arc.byte_order_char}) ARC '{arc_filename}' to '{relative_output_folder_str}'...", 'level': STATUS_INFO})
+        status_callback_worker(f" Extracting {len(arc.files)} files from {platform_name} (v{arc.version}, BO:{arc.byte_order_char}) ARC '{arc_filename}' to '{relative_output_folder_str}'...", STATUS_INFO)
 
 
         processed_count = 0; error_count = 0
         for file_info in arc.files:
             if not isinstance(file_info, dict) or "full_filename" not in file_info:
-                status_queue.put({'type':'status','msg':f"  Skipping invalid file info in {arc_filename}: {file_info!r}",'level':STATUS_WARN})
+                status_callback_worker(f"  Skipping invalid file info in {arc_filename}: {file_info!r}",STATUS_WARN)
                 error_count += 1; continue
             try:
                 file_data = arc.extract_file(file_info, str(arc_path))
@@ -1095,13 +1103,13 @@ def _list_extract_worker(arc_path_str: str, output_base_dir_str: str | None, key
 
                     if not current_component or ".." in current_component:
                         original_component_for_error_msg = component_str
-                        status_queue.put({'type':'status','msg':f"  Skipping unsafe or empty path component '{original_component_for_error_msg}' (became '{current_component}') from ARC path '{full_filename_from_arc}'.",'level':STATUS_ERROR})
+                        status_callback_worker(f"  Skipping unsafe or empty path component '{original_component_for_error_msg}' (became '{current_component}') from ARC path '{full_filename_from_arc}'.",'level',STATUS_ERROR)
                         raise ValueError(f"Unsafe or empty path component: '{current_component}' (original: '{original_component_for_error_msg}')")
                     sanitized_disk_components.append(current_component)
 
                 if not sanitized_disk_components:
                     sanitized_disk_components = [f"unnamed_file_{processed_count+error_count}_{file_info.get('ext_hash',0):08X}"]
-                    status_queue.put({'type':'status','msg':f"  Filename for entry in {arc_filename} became invalid or empty after sanitization. Using '{sanitized_disk_components[0]}'. Original: '{full_filename_from_arc}'",'level':STATUS_WARN})
+                    status_callback_worker(f"  Filename for entry in {arc_filename} became invalid or empty after sanitization. Using '{sanitized_disk_components[0]}'. Original: '{full_filename_from_arc}'",'level',STATUS_WARN)
 
                 output_file_path = output_folder.joinpath(*sanitized_disk_components)
 
@@ -1109,11 +1117,11 @@ def _list_extract_worker(arc_path_str: str, output_base_dir_str: str | None, key
                 with open(output_file_path, 'wb') as out_f: out_f.write(file_data)
                 processed_count += 1
             except (OSError, ValueError, PermissionError) as e:
-                status_queue.put({'type': 'status', 'msg': f"  File System Error writing '{file_info.get('full_filename','?')}' from {arc_filename}: {e}", 'level': STATUS_ERROR})
+                status_callback_worker(f"  File System Error writing '{file_info.get('full_filename','?')}' from {arc_filename}: {e}", STATUS_ERROR)
                 error_count += 1
             except Exception as e:
-                status_queue.put({'type': 'status', 'msg': f"  Error extracting '{file_info.get('full_filename','?')}' from {arc_filename}: {e}", 'level': STATUS_ERROR})
-                status_queue.put({'type':'status','msg':f"  Trace: {traceback.format_exc()}",'level':STATUS_DEBUG})
+                status_callback_worker(f"  Error extracting '{file_info.get('full_filename','?')}' from {arc_filename}: {e}", STATUS_ERROR)
+                status_callback_worker(f"  Trace: {traceback.format_exc()}",STATUS_DEBUG)
                 error_count += 1
 
         success = (error_count == 0) if (processed_count > 0 or len(arc.files)==0) else False
@@ -1124,21 +1132,23 @@ def _list_extract_worker(arc_path_str: str, output_base_dir_str: str | None, key
         msg = f"Finished {arc_filename}. {processed_count} extracted{msg_suffix}" if len(arc.files)>0 else f"No files in {arc_filename}."
         if not arc.files and error_count > 0 and processed_count == 0:
              msg = f"Failed loading/processing {arc_filename} (no files found or processed, {error_count} errors)."
-        status_queue.put({'type': 'status', 'msg': msg, 'level': level});
+        status_callback_worker(msg, level);
         return arc_filename, success
-    except ARCCSkippedError as e: 
-        return arc_path.name, True 
+    except ARCCSkippedError as e:
+        # status_callback_worker already handled by MTArc.load
+        return arc_path.name, True
     except (FileNotFoundError, PermissionError, IOError, ValueError, RuntimeError) as e:
-        status_queue.put({'type':'status','msg':f"Failed load/process ARC {arc_path.name}: {e}",'level':STATUS_ERROR})
+        status_callback_worker(f"Failed load/process ARC {arc_path.name}: {e}",STATUS_ERROR)
         return arc_path.name,False
     except Exception as e:
-        status_queue.put({'type': 'status', 'msg': f"Unexpected error processing ARC {arc_path.name}: {e}", 'level': STATUS_ERROR})
-        status_queue.put({'type':'status','msg':f"Trace: {traceback.format_exc()}",'level':STATUS_DEBUG})
+        status_callback_worker(f"Unexpected error processing ARC {arc_path.name}: {e}", STATUS_ERROR)
+        status_callback_worker(f"Trace: {traceback.format_exc()}",STATUS_DEBUG)
         return arc_path.name, False
     finally:
         if arc: arc.close()
 
-def _flatten_extract_worker(arc_path_str: str, common_output_dir_str: str, key1: str | None, key2: str | None, status_queue: queue.Queue):
+# MODIFIED: status_queue parameter to status_callback_worker
+def _flatten_extract_worker(arc_path_str: str, common_output_dir_str: str, key1: str | None, key2: str | None, status_callback_worker: callable):
     arc_path = pathlib.Path(arc_path_str)
     common_output_dir = pathlib.Path(common_output_dir_str)
     arc = None
@@ -1146,22 +1156,22 @@ def _flatten_extract_worker(arc_path_str: str, common_output_dir_str: str, key1:
         arc_filename = arc_path.name
         arc_basename_no_ext = arc_path.stem
 
-        status_queue.put({'type': 'status', 'msg': f"Attempting to load {arc_filename} for flattened extraction...", 'level': STATUS_DEBUG})
+        status_callback_worker(f"Attempting to load {arc_filename} for flattened extraction...", STATUS_DEBUG)
         arc = MTArc()
-        arc.load(str(arc_path), key1=key1, key2=key2, status_queue=status_queue)
+        arc.load(str(arc_path), key1=key1, key2=key2, status_queue_or_callback=status_callback_worker)
 
         if not os.access(common_output_dir, os.W_OK):
             raise PermissionError(f"Write permission denied for common output folder: {common_output_dir}")
 
         platform_name_map = {Platform.UNKNOWN: "Unknown", Platform.PC: "PC", Platform.CTR: "CTR", Platform.PS3: "PS3", Platform.Switch: "Switch"}
         platform_name = platform_name_map.get(arc.platform, f"PVal {arc.platform}")
-        status_queue.put({'type': 'status', 'msg': f" Flatten extracting {len(arc.files)} files from {platform_name} (v{arc.version}) ARC '{arc_filename}' to '{common_output_dir.name}/'...", 'level': STATUS_INFO})
+        status_callback_worker(f" Flatten extracting {len(arc.files)} files from {platform_name} (v{arc.version}) ARC '{arc_filename}' to '{common_output_dir.name}/'...", STATUS_INFO)
 
         processed_count = 0
         error_count = 0
         for file_info in arc.files:
             if not isinstance(file_info, dict) or "full_filename" not in file_info:
-                status_queue.put({'type':'status','msg':f"  Skipping invalid file info in {arc_filename} (flattened): {file_info!r}",'level':STATUS_WARN})
+                status_callback_worker(f"  Skipping invalid file info in {arc_filename} (flattened): {file_info!r}",STATUS_WARN)
                 error_count += 1
                 continue
             try:
@@ -1170,7 +1180,7 @@ def _flatten_extract_worker(arc_path_str: str, common_output_dir_str: str, key1:
                 internal_full_path = pathlib.Path(file_info.get("full_filename", ""))
                 sanitized_internal_basename = re.sub(r'[\x00-\x1F\\/:*?"<>|]', '_', internal_full_path.stem).strip(' .')
                 sanitized_internal_ext = internal_full_path.suffix
-                if not sanitized_internal_basename: 
+                if not sanitized_internal_basename:
                     sanitized_internal_basename = f"unnamed_{file_info.get('ext_hash',0):08X}"
 
                 flat_filename_str = f"{arc_basename_no_ext}_{sanitized_internal_basename}{sanitized_internal_ext}"
@@ -1184,11 +1194,11 @@ def _flatten_extract_worker(arc_path_str: str, common_output_dir_str: str, key1:
                     out_f.write(file_data)
                 processed_count += 1
             except (OSError, ValueError, PermissionError) as e:
-                status_queue.put({'type': 'status', 'msg': f"  File System Error writing '{file_info.get('full_filename','?')}' (flat) from {arc_filename}: {e}", 'level': STATUS_ERROR})
+                status_callback_worker(f"  File System Error writing '{file_info.get('full_filename','?')}' (flat) from {arc_filename}: {e}", STATUS_ERROR)
                 error_count += 1
             except Exception as e:
-                status_queue.put({'type': 'status', 'msg': f"  Error flat-extracting '{file_info.get('full_filename','?')}' from {arc_filename}: {e}", 'level': STATUS_ERROR})
-                status_queue.put({'type':'status','msg':f"  Trace: {traceback.format_exc()}",'level':STATUS_DEBUG})
+                status_callback_worker(f"  Error flat-extracting '{file_info.get('full_filename','?')}' from {arc_filename}: {e}", STATUS_ERROR)
+                status_callback_worker(f"  Trace: {traceback.format_exc()}",STATUS_DEBUG)
                 error_count += 1
 
         success = (error_count == 0) if (processed_count > 0 or len(arc.files) == 0) else False
@@ -1197,41 +1207,41 @@ def _flatten_extract_worker(arc_path_str: str, common_output_dir_str: str, key1:
                  (STATUS_ERROR if error_count > 0 else STATUS_INFO))
         msg_suffix = (f", {error_count} errors." if error_count else ".")
         msg = f"Finished flat extraction for {arc_filename}. {processed_count} files extracted{msg_suffix}" if len(arc.files) > 0 else f"No files in {arc_filename} for flat extraction."
-        status_queue.put({'type': 'status', 'msg': msg, 'level': level})
+        status_callback_worker(msg, level)
         return arc_filename, success
-    except ARCCSkippedError as e: 
+    except ARCCSkippedError as e:
         return arc_path.name, True
     except (FileNotFoundError, PermissionError, IOError, ValueError, RuntimeError) as e:
-        status_queue.put({'type':'status','msg':f"Failed load/process ARC {arc_path.name} (flattened): {e}",'level':STATUS_ERROR})
+        status_callback_worker(f"Failed load/process ARC {arc_path.name} (flattened): {e}",STATUS_ERROR)
         return arc_path.name, False
     except Exception as e:
-        status_queue.put({'type': 'status', 'msg': f"Unexpected error processing ARC {arc_path.name} (flattened): {e}", 'level': STATUS_ERROR})
-        status_queue.put({'type':'status','msg':f"Trace: {traceback.format_exc()}",'level':STATUS_DEBUG})
+        status_callback_worker(f"Unexpected error processing ARC {arc_path.name} (flattened): {e}", STATUS_ERROR)
+        status_callback_worker(f"Trace: {traceback.format_exc()}",STATUS_DEBUG)
         return arc_path.name, False
     finally:
         if arc: arc.close()
 
-
+# MODIFIED: status_queue parameter to status_callback_worker
 def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str | None,
-                        key1: str | None, key2: str | None, status_queue: queue.Queue,
+                        key1: str | None, key2: str | None, status_callback_worker: callable,
                         target_arc_filename_override: str | None = None,
                         original_arc_version: int | None = None,
                         original_arc_platform: Platform | None = None,
                         original_arc_byte_order_char: str | None = None,
-                        target_is_arcc: bool = False, 
+                        target_is_arcc: bool = False,
                         original_file_order: list | None = None,
                         entry_has_extended_names_for_rebuild: bool = False,
-                        original_file_metadata_map: dict | None = None): 
+                        original_file_metadata_map: dict | None = None):
     source_folder_path = pathlib.Path(source_folder_str)
     if not output_rebuilt_dir_str:
-        status_queue.put({'type':'status','msg':f"Output dir not provided for '{source_folder_path.name}'.",'level':STATUS_ERROR})
+        status_callback_worker(f"Output dir not provided for '{source_folder_path.name}'.",STATUS_ERROR)
         return source_folder_path.name, False
     output_rebuilt_dir = pathlib.Path(output_rebuilt_dir_str); arc_saver = None
     try:
         folder_name_raw = source_folder_path.name
         arc_base_name = folder_name_raw[:-4] if folder_name_raw.endswith("_arc") else folder_name_raw
         output_arc_path = output_rebuilt_dir / (target_arc_filename_override if target_arc_filename_override else f"{arc_base_name}.arc")
-        status_queue.put({'type': 'status', 'msg': f"Processing folder '{folder_name_raw}' for rebuild as '{output_arc_path.name}'...", 'level': STATUS_DEBUG})
+        status_callback_worker(f"Processing folder '{folder_name_raw}' for rebuild as '{output_arc_path.name}'...", STATUS_DEBUG)
 
         files_to_pack = []; has_files_in_folder = False; error_reading_files = False
         name_field_len_for_fi_base = 128 if entry_has_extended_names_for_rebuild else 64
@@ -1244,7 +1254,7 @@ def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str | No
                 if file_path_obj.is_file():
                     has_files_in_folder = True
                     if not os.access(str(file_path_obj), os.R_OK):
-                        status_queue.put({'type':'status','msg':f"  Permission denied reading file '{file_path_obj.relative_to(source_folder_path)}'. Skipping.",'level':STATUS_ERROR})
+                        status_callback_worker(f"  Permission denied reading file '{file_path_obj.relative_to(source_folder_path)}'. Skipping.",STATUS_ERROR)
                         error_reading_files = True; continue
                     try:
                         with open(file_path_obj, 'rb') as f: data = f.read()
@@ -1284,26 +1294,26 @@ def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str | No
 
                         files_to_pack.append(fi)
                     except Exception as e_proc_file:
-                        status_queue.put({'type':'status','msg':f"  Error processing file '{file_path_obj.relative_to(source_folder_path)}': {e_proc_file}",'level':STATUS_ERROR})
+                        status_callback_worker(f"  Error processing file '{file_path_obj.relative_to(source_folder_path)}': {e_proc_file}",STATUS_ERROR)
                         traceback.print_exc(file=sys.stderr)
                         error_reading_files = True
         except (FileNotFoundError, PermissionError) as e_scan_folder:
-            status_queue.put({'type':'status','msg':f"Error accessing input folder '{folder_name_raw}': {e_scan_folder}",'level':STATUS_ERROR})
+            status_callback_worker(f"Error accessing input folder '{folder_name_raw}': {e_scan_folder}",STATUS_ERROR)
             return folder_name_raw,False
         except Exception as e_scan_unexpected:
-            status_queue.put({'type':'status','msg':f"Unexpected error scanning folder '{folder_name_raw}': {e_scan_unexpected}",'level':STATUS_ERROR})
+            status_callback_worker(f"Unexpected error scanning folder '{folder_name_raw}': {e_scan_unexpected}",STATUS_ERROR)
             traceback.print_exc(file=sys.stderr)
             return folder_name_raw,False
 
         if not has_files_in_folder:
-            status_queue.put({'type':'status','msg':f"Skipping empty folder: {folder_name_raw}",'level':STATUS_WARN})
+            status_callback_worker(f"Skipping empty folder: {folder_name_raw}",STATUS_WARN)
             return folder_name_raw,True
         if not files_to_pack and has_files_in_folder :
-            status_queue.put({'type':'status','msg':f"Skipping '{folder_name_raw}', no files processed (all had errors or were unreadable).",'level':STATUS_ERROR})
+            status_callback_worker(f"Skipping '{folder_name_raw}', no files processed (all had errors or were unreadable).",STATUS_ERROR)
             return folder_name_raw,False
 
         if original_file_order:
-            status_queue.put({'type':'status','msg':f" Sorting files for '{folder_name_raw}' based on original ARC order.",'level':STATUS_DEBUG})
+            status_callback_worker(f" Sorting files for '{folder_name_raw}' based on original ARC order.",STATUS_DEBUG)
             file_map_by_norm_path = {
                 fi['full_filename'].lower().replace('\\', '/'): fi
                 for fi in files_to_pack
@@ -1319,7 +1329,7 @@ def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str | No
                 if orig_fn_norm_lower in file_map_by_norm_path:
                     sorted_files.append(file_map_by_norm_path.pop(orig_fn_norm_lower))
                 else:
-                    status_queue.put({'type':'status','msg':f"  Info: File '{orig_fn_case_preserved}' from original order not found in source folder '{folder_name_raw}'. It will be omitted.",'level':STATUS_DEBUG})
+                    status_callback_worker(f"  Info: File '{orig_fn_case_preserved}' from original order not found in source folder '{folder_name_raw}'. It will be omitted.",STATUS_DEBUG)
 
             new_files_alpha_sorted = sorted(
                 file_map_by_norm_path.values(),
@@ -1327,15 +1337,15 @@ def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str | No
             )
 
             for new_fi in new_files_alpha_sorted:
-                status_queue.put({'type':'status','msg':f"  Info: New file '{new_fi['full_filename']}' (not in original order) added to end of ARC for '{folder_name_raw}'.",'level':STATUS_DEBUG})
+                status_callback_worker(f"  Info: New file '{new_fi['full_filename']}' (not in original order) added to end of ARC for '{folder_name_raw}'.",STATUS_DEBUG)
 
             files_to_pack = sorted_files + new_files_alpha_sorted
         else:
-            status_queue.put({'type':'status','msg':f" Sorting files for '{folder_name_raw}' alphabetically (no original order provided).",'level':STATUS_DEBUG})
+            status_callback_worker(f" Sorting files for '{folder_name_raw}' alphabetically (no original order provided).",STATUS_DEBUG)
             try:
                 files_to_pack.sort(key=lambda fi_sort: fi_sort.get("full_filename", "").lower().replace('\\', '/'))
             except Exception as e_sort:
-                status_queue.put({'type':'status','msg':f"Warning: Alphabetical sort of files failed for '{folder_name_raw}': {e_sort}. Using unsorted order.",'level':STATUS_WARN})
+                status_callback_worker(f"Warning: Alphabetical sort of files failed for '{folder_name_raw}': {e_sort}. Using unsorted order.",STATUS_WARN)
 
         arc_params_desc = "default (Switch v9, LE, 64b names)"
         if original_arc_version is not None and original_arc_platform is not None and original_arc_byte_order_char is not None:
@@ -1343,20 +1353,20 @@ def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str | No
             p_name_desc = platform_map_names.get(original_arc_platform, f"PVal?{original_arc_platform}")
             bo_name_desc = "BE" if original_arc_byte_order_char == '>' else "LE"
             name_len_desc = "128b" if entry_has_extended_names_for_rebuild else "64b"
-            arcc_desc = "" 
-            
+            arcc_desc = ""
+
             using_original_params_for_non_default = not (
                 original_arc_version == DEFAULT_VERSION and
                 original_arc_platform == DEFAULT_PLATFORM and
                 original_arc_byte_order_char == DEFAULT_BYTE_ORDER_CHAR and
-                not entry_has_extended_names_for_rebuild and 
-                not target_is_arcc 
+                not entry_has_extended_names_for_rebuild and
+                not target_is_arcc
             )
             if using_original_params_for_non_default or original_file_order is not None or original_file_metadata_map:
                 arc_params_desc = f"original (v{original_arc_version}, P:{p_name_desc}, BO:{bo_name_desc}, Names:{name_len_desc}{arcc_desc})"
         key_info_desc = ""
 
-        status_queue.put({'type':'status','msg':f" Rebuilding '{output_arc_path.name}' ({len(files_to_pack)} files) using params: {arc_params_desc}{key_info_desc}...",'level':STATUS_INFO})
+        status_callback_worker(f" Rebuilding '{output_arc_path.name}' ({len(files_to_pack)} files) using params: {arc_params_desc}{key_info_desc}...",STATUS_INFO)
 
         arc_saver = MTArc();
         try:
@@ -1371,41 +1381,41 @@ def _list_inject_worker(source_folder_str: str, output_rebuilt_dir_str: str | No
         try:
             if source_folder_path.resolve(strict=True).is_dir() and \
                output_arc_path.resolve(strict=False).is_relative_to(source_folder_path.resolve(strict=True)):
-                status_queue.put({'type':'status','msg':f"Error: Output file '{output_arc_path.name}' would be inside its source folder '{folder_name_raw}'. Aborting to prevent data loss/recursion.",'level':STATUS_ERROR})
+                status_callback_worker(f"Error: Output file '{output_arc_path.name}' would be inside its source folder '{folder_name_raw}'. Aborting to prevent data loss/recursion.",STATUS_ERROR)
                 return folder_name_raw, False
         except Exception as e_path_safety:
-             status_queue.put({'type':'status','msg':f"Warning: Path safety check for output '{output_arc_path.name}' encountered an issue: {e_path_safety}. Proceeding with caution.",'level':STATUS_WARN})
+             status_callback_worker(f"Warning: Path safety check for output '{output_arc_path.name}' encountered an issue: {e_path_safety}. Proceeding with caution.",STATUS_WARN)
 
-        arc_saver.save(str(output_arc_path), files_to_pack, key1=key1, key2=key2, 
+        arc_saver.save(str(output_arc_path), files_to_pack, key1=key1, key2=key2,
                        target_version=original_arc_version, target_platform=original_arc_platform,
-                       target_byte_order_char=original_arc_byte_order_char, target_is_arcc=target_is_arcc, 
+                       target_byte_order_char=original_arc_byte_order_char, target_is_arcc=target_is_arcc,
                        target_entry_has_extended_names=entry_has_extended_names_for_rebuild)
 
-        status_queue.put({'type':'status','msg':f"Successfully rebuilt '{output_arc_path.name}'", 'level':STATUS_SUCCESS})
+        status_callback_worker(f"Successfully rebuilt '{output_arc_path.name}'", STATUS_SUCCESS)
         return folder_name_raw, True
     except (FileNotFoundError, PermissionError, IOError, ValueError, RuntimeError) as e_worker_main:
-        status_queue.put({'type':'status','msg':f"Failed to process folder '{source_folder_path.name}': {e_worker_main}",'level':STATUS_ERROR})
+        status_callback_worker(f"Failed to process folder '{source_folder_path.name}': {e_worker_main}",STATUS_ERROR)
         traceback.print_exc(file=sys.stderr)
         return source_folder_path.name,False
     except Exception as e_worker_unexpected:
-        status_queue.put({'type': 'status', 'msg': f"Unexpected error processing folder '{source_folder_path.name}': {e_worker_unexpected}", 'level': STATUS_ERROR})
+        status_callback_worker(f"Unexpected error processing folder '{source_folder_path.name}': {e_worker_unexpected}", STATUS_ERROR)
         traceback.print_exc(file=sys.stderr)
         return source_folder_path.name, False
     finally:
         if arc_saver: arc_saver.close()
 
-
+# MODIFIED: Removed internal status_queue, workers now use status_callback directly
 def run_batch_parallel(worker_func, item_list, output_dir: str | None, progress_callback, status_callback, key1, key2,
                        original_arc_params_list: list | None = None,
-                       target_is_arcc_list: list | None = None, 
+                       target_is_arcc_list: list | None = None,
                        original_file_orders_list: list | None = None,
                        original_file_metadata_map_list: list | None = None):
     if not item_list:
         status_callback("No items selected for batch operation.", STATUS_WARN)
         progress_callback(100); return
 
-    if worker_func == _list_inject_worker or worker_func == _flatten_extract_worker: 
-        if output_dir: 
+    if worker_func == _list_inject_worker or worker_func == _flatten_extract_worker:
+        if output_dir:
             output_path_obj = pathlib.Path(output_dir)
             try:
                 if output_path_obj.exists():
@@ -1422,7 +1432,6 @@ def run_batch_parallel(worker_func, item_list, output_dir: str | None, progress_
     total_tasks = len(item_list)
     status_callback(f"Starting parallel batch operation ({total_tasks} items) using {worker_func.__name__}...", STATUS_INFO)
     start_time = time.perf_counter(); completed_tasks = 0; success_count = 0; failure_count = 0
-    status_queue = queue.Queue()
     futures = []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -1431,13 +1440,13 @@ def run_batch_parallel(worker_func, item_list, output_dir: str | None, progress_
 
             args_for_worker = [item_path_str]
             if worker_func == _list_extract_worker:
-                args_for_worker.extend([None, key1, key2, status_queue]) 
+                args_for_worker.extend([None, key1, key2, status_callback]) # Pass main status_callback to worker
             elif worker_func == _flatten_extract_worker:
-                args_for_worker.extend([output_dir, key1, key2, status_queue])
+                args_for_worker.extend([output_dir, key1, key2, status_callback]) # Pass main status_callback
             elif worker_func == _list_inject_worker:
                 args_for_worker.append(output_dir)
-                args_for_worker.extend([key1, key2, status_queue])
-                args_for_worker.append(None)
+                args_for_worker.extend([key1, key2, status_callback]) # Pass main status_callback
+                args_for_worker.append(None) # target_arc_filename_override
 
                 params = (original_arc_params_list[i]
                           if original_arc_params_list and i < len(original_arc_params_list) else {})
@@ -1445,7 +1454,7 @@ def run_batch_parallel(worker_func, item_list, output_dir: str | None, progress_
 
                 is_arcc = (target_is_arcc_list[i]
                            if target_is_arcc_list and i < len(target_is_arcc_list) else False)
-                args_for_worker.append(is_arcc) 
+                args_for_worker.append(is_arcc)
 
                 file_order = (original_file_orders_list[i]
                               if original_file_orders_list and i < len(original_file_orders_list) else None)
@@ -1464,19 +1473,7 @@ def run_batch_parallel(worker_func, item_list, output_dir: str | None, progress_
             futures.append(executor.submit(worker_func, *args_for_worker))
 
         for future in concurrent.futures.as_completed(futures):
-            while not status_queue.empty():
-                try:
-                    msg_item = status_queue.get_nowait()
-                    if msg_item and 'msg' in msg_item and 'level' in msg_item:
-                         status_callback(msg_item['msg'], msg_item['level'])
-                    elif msg_item:
-                         status_callback(f"Malformed status item: {msg_item!r}", STATUS_DEBUG)
-                except queue.Empty:
-                    break
-                except Exception as e_q_get:
-                    print(f"Error getting from status_queue: {e_q_get}", file=sys.stderr)
-                    status_callback(f"Internal error processing status queue: {e_q_get}", STATUS_ERROR)
-
+            # Worker messages are now directly handled by the passed status_callback
             try:
                 item_name, success = future.result()
                 if success: success_count += 1
@@ -1488,19 +1485,9 @@ def run_batch_parallel(worker_func, item_list, output_dir: str | None, progress_
             completed_tasks += 1
             progress_callback(completed_tasks / total_tasks * 100)
 
-    while not status_queue.empty():
-        try:
-            msg_item = status_queue.get_nowait()
-            if msg_item and 'msg' in msg_item and 'level' in msg_item:
-                 status_callback(msg_item['msg'], msg_item['level'])
-            elif msg_item:
-                 status_callback(f"Malformed status item (final flush): {msg_item!r}", STATUS_DEBUG)
-        except queue.Empty:
-            break
-        except Exception as e_q_get_final:
-             print(f"Error getting from status_queue (final): {e_q_get_final}", file=sys.stderr)
-             status_callback(f"Internal error processing status queue (final): {e_q_get_final}", STATUS_ERROR)
-
+    # Worker messages are directly handled. This final flush is not strictly necessary
+    # if all workers have completed and their callbacks were synchronous (like print).
+    # Kept for safety in case of complex callback chains, but likely redundant for CLI.
 
     end_time = time.perf_counter(); duration = end_time - start_time
     summary_msg = f"Batch operation complete. Time: {duration:.2f} seconds. "
@@ -1534,7 +1521,7 @@ def recursive_batch_extract(source_root_dir: str, output_base_dir: str | None, p
     if not arc_files:
         status_callback(f"No *.arc files found in '{source_root_dir}' or its subdirectories.", STATUS_WARN)
         progress_callback(100); return
-    run_batch_parallel(_list_extract_worker, arc_files, None, progress_callback, status_callback, key1, key2) 
+    run_batch_parallel(_list_extract_worker, arc_files, None, progress_callback, status_callback, key1, key2)
 
 
 def recursive_flatten_extract(source_root_dir: str, common_output_dir: str, progress_callback: callable, status_callback: callable, key1: str | None, key2: str | None):
@@ -1565,12 +1552,12 @@ def recursive_flatten_extract(source_root_dir: str, common_output_dir: str, prog
         status_callback(f"No *.arc files found in '{source_root_dir}' or its subdirectories for flattened extraction.", STATUS_WARN)
         progress_callback(100); return
 
-    run_batch_parallel(_flatten_extract_worker, arc_files, common_output_dir, progress_callback, status_callback, key1, key2) 
+    run_batch_parallel(_flatten_extract_worker, arc_files, common_output_dir, progress_callback, status_callback, key1, key2)
 
 
 def folder_batch_inject(source_dir_str: str, progress_callback: callable, status_callback: callable,
                         key1: str | None, key2: str | None, max_workers=None):
-    start_time_overall = time.perf_counter() 
+    start_time_overall = time.perf_counter()
     status_callback("Scanning for edited folders (*_arc) and matching original ARCs for in-place rebuild...", STATUS_INFO)
     if not source_dir_str:
         status_callback("Input Missing: Select source directory for folder injection.", STATUS_ERROR)
@@ -1580,7 +1567,7 @@ def folder_batch_inject(source_dir_str: str, progress_callback: callable, status
     if not source_path.is_dir():
         status_callback(f"Source '{source_dir_str}' is not a valid directory.", STATUS_ERROR)
         progress_callback(0); return
-    if not os.access(source_path, os.R_OK | os.W_OK):
+    if not os.access(source_path, os.R_OK | os.W_OK): # Check for write permission as well for backups
         status_callback(f"Read/Write permission denied for source directory: {source_dir_str}", STATUS_ERROR)
         progress_callback(0); return
 
@@ -1588,8 +1575,9 @@ def folder_batch_inject(source_dir_str: str, progress_callback: callable, status
     original_backup_root.mkdir(parents=True, exist_ok=True)
 
     tasks_for_submission = []
-    scan_status_queue = queue.Queue();
-    temp_status_callback = lambda msg, level: scan_status_queue.put({'type':'status','msg':msg,'level':level})
+    # For CLI, status_callback is directly usable. For GUI, we'd use the queue via self.queue_status
+    # The status_callback passed to folder_batch_inject will be the one to use.
+    temp_status_callback_for_scan = status_callback # Use the main callback
 
     try:
         for edited_folder in source_path.rglob('*_arc'):
@@ -1599,7 +1587,7 @@ def folder_batch_inject(source_dir_str: str, progress_callback: callable, status
                 if original_backup_root.resolve(strict=True).is_dir() and \
                    (original_backup_root.resolve(strict=True) in edited_folder.resolve(strict=True).parents or \
                     original_backup_root.resolve(strict=True) == edited_folder.resolve(strict=True)):
-                    temp_status_callback(f"Skipping folder within backup directory: {edited_folder.relative_to(source_path)}", STATUS_DEBUG)
+                    temp_status_callback_for_scan(f"Skipping folder within backup directory: {edited_folder.relative_to(source_path)}", STATUS_DEBUG)
                     continue
             except Exception: pass
 
@@ -1611,34 +1599,31 @@ def folder_batch_inject(source_dir_str: str, progress_callback: callable, status
             original_arc_exists_archived = archived_original_arc_path.is_file()
 
             if not original_arc_exists_live and not original_arc_exists_archived:
-                temp_status_callback(f"Original ARC '{original_arc_file_path.name}' (or its archive) not found for folder '{edited_folder.name}'. Skipping rebuild.", STATUS_WARN)
+                temp_status_callback_for_scan(f"Original ARC '{original_arc_file_path.name}' (or its archive) not found for folder '{edited_folder.name}'. Skipping rebuild.", STATUS_WARN)
                 continue
 
             try:
                 if original_arc_exists_live and original_arc_file_path.resolve(strict=True).is_file() and \
                    edited_folder.resolve(strict=True).is_dir() and \
                    original_arc_file_path.resolve(strict=True).is_relative_to(edited_folder.resolve(strict=True)):
-                    temp_status_callback(f"Skipping '{edited_folder.name}': Its corresponding original ARC '{original_arc_file_path.name}' is located inside it. Move the ARC outside.", STATUS_ERROR)
+                    temp_status_callback_for_scan(f"Skipping '{edited_folder.name}': Its corresponding original ARC '{original_arc_file_path.name}' is located inside it. Move the ARC outside.", STATUS_ERROR)
                     continue
             except Exception: pass
 
 
-            params_to_use = {"version": None, "platform": None, "bo_char": None, 
+            params_to_use = {"version": None, "platform": None, "bo_char": None,
                              "file_order": None, "entry_has_extended_names": False,
-                             "original_file_metadata_map": {}} 
+                             "original_file_metadata_map": {}}
             arc_to_get_params_from_path = original_arc_file_path if original_arc_exists_live else archived_original_arc_path
             temp_arc_loader = None
             try:
-                temp_status_callback(f"Attempting to load '{arc_to_get_params_from_path.name}' to get parameters...", STATUS_DEBUG)
+                temp_status_callback_for_scan(f"Attempting to load '{arc_to_get_params_from_path.name}' to get parameters...", STATUS_DEBUG)
                 temp_arc_loader = MTArc()
-                temp_load_status_queue = queue.Queue()
-                temp_arc_loader.load(str(arc_to_get_params_from_path), status_queue=temp_load_status_queue) 
-                while not temp_load_status_queue.empty():
-                    msg_item = temp_load_status_queue.get_nowait()
-                    temp_status_callback(f"(Load param scan for {arc_to_get_params_from_path.name}) {msg_item['msg']}", msg_item['level'])
+                # For MTArc.load, pass the status_callback directly (it will handle queue-like or direct)
+                temp_arc_loader.load(str(arc_to_get_params_from_path), status_queue_or_callback=temp_status_callback_for_scan)
 
                 if not temp_arc_loader.arc_header:
-                    temp_status_callback(f"ERROR: Failed to load or parse header of original ARC '{arc_to_get_params_from_path.name}'. Cannot determine parameters for rebuild. Skipping this item.", STATUS_ERROR)
+                    temp_status_callback_for_scan(f"ERROR: Failed to load or parse header of original ARC '{arc_to_get_params_from_path.name}'. Cannot determine parameters for rebuild. Skipping this item.", STATUS_ERROR)
                     if temp_arc_loader: temp_arc_loader.close()
                     continue
 
@@ -1650,7 +1635,7 @@ def folder_batch_inject(source_dir_str: str, progress_callback: callable, status
                             'is_compressed': fi_orig['is_compressed'],
                             'uncompressed_size_raw': fi_orig['uncompressed_size_raw']
                         }
-                
+
                 params_to_use.update({
                     "version": temp_arc_loader.version,
                     "platform": temp_arc_loader.platform,
@@ -1659,14 +1644,14 @@ def folder_batch_inject(source_dir_str: str, progress_callback: callable, status
                     "entry_has_extended_names": temp_arc_loader.entry_has_extended_names,
                     "original_file_metadata_map": current_file_metadata_map
                 })
-                temp_status_callback(f"Read params from '{arc_to_get_params_from_path.name}': v{params_to_use['version']}, P:{params_to_use['platform']}, BO:{params_to_use['bo_char']}, ExtNames:{params_to_use['entry_has_extended_names']}, Files:{len(params_to_use.get('file_order',[]))}", STATUS_DEBUG)
+                temp_status_callback_for_scan(f"Read params from '{arc_to_get_params_from_path.name}': v{params_to_use['version']}, P:{params_to_use['platform']}, BO:{params_to_use['bo_char']}, ExtNames:{params_to_use['entry_has_extended_names']}, Files:{len(params_to_use.get('file_order',[]))}", STATUS_DEBUG)
 
-            except ARCCSkippedError as e_arcc_skip_params: 
-                temp_status_callback(f"Info: Cannot use parameters from '{arc_to_get_params_from_path.name}' (skipped as .arcc). Skipping rebuild for '{edited_folder.name}'.", STATUS_INFO)
+            except ARCCSkippedError as e_arcc_skip_params:
+                temp_status_callback_for_scan(f"Info: Cannot use parameters from '{arc_to_get_params_from_path.name}' (skipped as .arcc). Skipping rebuild for '{edited_folder.name}'.", STATUS_INFO)
                 if temp_arc_loader: temp_arc_loader.close()
-                continue 
+                continue
             except Exception as e_load_params:
-                temp_status_callback(f"ERROR: Exception while loading original ARC '{arc_to_get_params_from_path.name}' for parameters: {e_load_params}. Skipping rebuild for this item.", STATUS_ERROR)
+                temp_status_callback_for_scan(f"ERROR: Exception while loading original ARC '{arc_to_get_params_from_path.name}' for parameters: {e_load_params}. Skipping rebuild for this item.", STATUS_ERROR)
                 traceback.print_exc(file=sys.stderr)
                 if temp_arc_loader: temp_arc_loader.close()
                 continue
@@ -1677,17 +1662,13 @@ def folder_batch_inject(source_dir_str: str, progress_callback: callable, status
                 "edited_folder_str": str(edited_folder),
                 "original_arc_target_location_str": str(original_arc_file_path),
                 "target_arc_filename_str": original_arc_file_path.name,
-                "original_arc_params": params_to_use, 
+                "original_arc_params": params_to_use,
                 "archived_original_arc_path_str": str(archived_original_arc_path)
             })
     except Exception as e_scan_folders_main:
         status_callback(f"Error during initial scan for folders/ARCs: {e_scan_folders_main}", STATUS_ERROR)
         traceback.print_exc(file=sys.stderr)
         progress_callback(0); return
-    finally:
-        while not scan_status_queue.empty():
-            try: msg_item = scan_status_queue.get_nowait(); status_callback(msg_item['msg'], msg_item['level'])
-            except queue.Empty: break
 
     if not tasks_for_submission:
         status_callback("No matching *_arc folders and corresponding .arc files (with readable parameters) found to process.", STATUS_WARN)
@@ -1739,17 +1720,15 @@ def folder_batch_inject(source_dir_str: str, progress_callback: callable, status
         return
 
     status_callback(f"Starting parallel rebuild for {len(tasks_ready_for_parallel_rebuild)} items...", STATUS_INFO)
-    rebuild_status_queue = queue.Queue()
-    completed_rebuilds_count = 0
-    failed_rebuilds_count = 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Pass status_callback directly to _list_inject_worker
         future_to_task_info_map = {
             executor.submit(
                 _list_inject_worker,
                 task_info["edited_folder_str"],
-                str(pathlib.Path(task_info["original_arc_target_location_str"]).parent),
-                key1, key2, rebuild_status_queue, 
+                str(pathlib.Path(task_info["original_arc_target_location_str"]).parent), # output_rebuilt_dir_str
+                key1, key2, status_callback, # status_callback_worker is now status_callback
                 task_info["target_arc_filename_str"],
                 task_info["original_arc_params"]["version"],
                 task_info["original_arc_params"]["platform"],
@@ -1762,17 +1741,15 @@ def folder_batch_inject(source_dir_str: str, progress_callback: callable, status
         }
 
         processed_in_parallel_count = 0
+        completed_rebuilds_count = 0
+        failed_rebuilds_count = 0
         for future in concurrent.futures.as_completed(future_to_task_info_map):
             task_info_completed = future_to_task_info_map[future]
             original_arc_final_loc_p = pathlib.Path(task_info_completed["original_arc_target_location_str"])
             edited_folder_p = pathlib.Path(task_info_completed["edited_folder_str"])
             actual_archived_original_path_str = task_info_completed.get("actual_archived_path_str")
 
-            while not rebuild_status_queue.empty():
-                try: msg = rebuild_status_queue.get_nowait(); status_callback(msg['msg'], msg['level'])
-                except queue.Empty: break
-                except Exception as e_q_get_rebuild: status_callback(f"Error getting from rebuild_status_queue: {e_q_get_rebuild}", STATUS_ERROR)
-
+            # Worker messages are now directly handled by the passed status_callback
             try:
                 _, success = future.result()
                 if success:
@@ -1822,10 +1799,6 @@ def folder_batch_inject(source_dir_str: str, progress_callback: callable, status
             current_total_processed_for_progress = failed_archive_or_setup_count + processed_in_parallel_count
             progress_callback(current_total_processed_for_progress / total_initial_tasks * 100)
 
-    while not rebuild_status_queue.empty():
-        try: msg = rebuild_status_queue.get_nowait(); status_callback(msg['msg'], msg['level'])
-        except queue.Empty: break
-        except Exception as e_q_final: status_callback(f"Error final flush rebuild_status_queue: {e_q_final}", STATUS_ERROR)
 
     duration = time.perf_counter() - start_time_overall
     total_failures_overall = failed_archive_or_setup_count + failed_rebuilds_count
@@ -1847,8 +1820,8 @@ class ArcToolApp:
         self.root.title("SaladSoftware ARC Tool");
         self.root.configure(bg=BG_COLOR);
         self.root.geometry("1220x900");
-        self.default_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE); 
-        self.bold_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE, weight="bold"); 
+        self.default_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE);
+        self.bold_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE, weight="bold");
         self.title_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE + 2, weight="bold")
         self.tab_label_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE - 2)
         self.queue = queue.Queue(); self.style = ttk.Style(); self.configure_styles()
@@ -1856,15 +1829,15 @@ class ArcToolApp:
         self.main_paned_window = ttk.PanedWindow(root, orient=tk.VERTICAL, style='TPanedwindow'); self.main_paned_window.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         self.top_pane_frame = ttk.Frame(self.main_paned_window, style='TFrame'); self.main_paned_window.add(self.top_pane_frame, weight=3)
 
-        header_frame = ttk.Frame(self.top_pane_frame, style='TFrame'); 
+        header_frame = ttk.Frame(self.top_pane_frame, style='TFrame');
         header_frame.pack(pady=5, padx=10, fill='x')
-        ttk.Label(header_frame, text="~ Handburger's SaladSoftware MT Arc Tool ~", style='TLabel', font=self.title_font).pack(side=tk.LEFT, anchor='w')
+        ttk.Label(header_frame, text=f"~ Handburger's SaladSoftware MT Arc Tool ~ Version {VERSION}", style='TLabel', font=self.title_font).pack(side=tk.LEFT, anchor='w')
         self.help_button = ttk.Button(header_frame, text="Help", command=self.show_help, style='TButton'); self.help_button.pack(side=tk.RIGHT, padx=5, pady=5)
-        
+
         attribution_text = "Uses Kuriimu1 and Kuriimu2 MT Arc Logic (GPL-3.0 License - legal permission to copy, distribute, and modify)"
-        ttk.Label(self.top_pane_frame, 
-                  text=attribution_text, 
-                  style='TLabel', 
+        ttk.Label(self.top_pane_frame,
+                  text=attribution_text,
+                  style='TLabel',
                   font=self.tab_label_font).pack(anchor='w', pady=(0, 10), padx=10)
 
         self.notebook = ttk.Notebook(self.top_pane_frame, style='TNotebook')
@@ -1874,7 +1847,7 @@ class ArcToolApp:
         self.folder_inject_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
         self.flatten_extract_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
         self.internal_arc_extract_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
-        self.internal_arc_inject_frame = ttk.Frame(self.notebook, style='TFrame', padding=10) 
+        self.internal_arc_inject_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
 
         self.notebook.add(self.list_extract_frame, text='Extract Arc Files')
         self.notebook.add(self.list_inject_frame, text='Inject Arc Folders')
@@ -1882,14 +1855,14 @@ class ArcToolApp:
         self.notebook.add(self.folder_inject_frame, text='Recursive Inject (In-Place)')
         self.notebook.add(self.flatten_extract_frame, text='Extract All (Flatten)')
         self.notebook.add(self.internal_arc_extract_frame, text='Internal-ARC Extraction')
-        self.notebook.add(self.internal_arc_inject_frame, text='Internal-ARC Injection') 
+        self.notebook.add(self.internal_arc_inject_frame, text='Internal-ARC Injection')
 
         self.notebook.pack(pady=5, padx=10, expand=True, fill='both')
 
         self.create_list_extract_widgets(); self.create_list_inject_widgets(); self.create_recursive_extract_widgets(); self.create_folder_inject_widgets()
         self.create_flatten_extract_widgets()
         self.create_internal_arc_extract_widgets()
-        self.create_internal_arc_inject_widgets() 
+        self.create_internal_arc_inject_widgets()
 
         self.bottom_pane_frame = ttk.Frame(self.main_paned_window, style='TFrame');
         self.main_paned_window.add(self.bottom_pane_frame, weight=1)
@@ -1913,12 +1886,12 @@ class ArcToolApp:
         self.progress_bar = ttk.Progressbar(self.bottom_pane_frame, orient='horizontal', length=100, mode='determinate', variable=self.progress_var, style='TProgressbar');
         self.progress_bar.pack(pady=10, padx=10, fill='x', side=tk.BOTTOM)
 
-        self.current_arc_for_internal_view = None 
-        self.tree_item_data = {} 
+        self.current_arc_for_internal_view = None
+        self.tree_item_data = {}
 
         self.current_arc_for_internal_inject_view = None
-        self.internal_inject_tree_item_data = {} 
-        self.files_to_inject_map = {} 
+        self.internal_inject_tree_item_data = {}
+        self.files_to_inject_map = {}
 
         if TkinterDnD:
             self.setup_drag_and_drop()
@@ -1935,23 +1908,23 @@ class ArcToolApp:
         self.style.configure('TEntry',fieldbackground=WIDGET_BG,foreground=INPUT_TEXT_COLOR,insertcolor=INPUT_TEXT_COLOR,bordercolor=BUTTON_BORDER); self.style.map('TEntry',selectbackground=[('focus',HIGHLIGHT_BG)],selectforeground=[('focus',HIGHLIGHT_TEXT)])
         listbox_opts = {'background': WIDGET_BG, 'foreground': TEXT_COLOR, 'selectbackground': HIGHLIGHT_BG, 'selectforeground': HIGHLIGHT_TEXT, 'font': self.default_font, 'bd': 1, 'relief': 'sunken', 'highlightthickness': 1, 'highlightbackground': BUTTON_BORDER, 'highlightcolor': HIGHLIGHT_BG}
         for opt, val in listbox_opts.items(): self.root.option_add(f'*Listbox*{opt}', val)
-        self.style.configure('TNotebook',background=BG_COLOR,borderwidth=0); 
-        self.style.configure('TNotebook.Tab',background=HEADER_BG,foreground=HEADER_TEXT,padding=[10,5],font=self.tab_label_font,borderwidth=1); 
+        self.style.configure('TNotebook',background=BG_COLOR,borderwidth=0);
+        self.style.configure('TNotebook.Tab',background=HEADER_BG,foreground=HEADER_TEXT,padding=[10,5],font=self.tab_label_font,borderwidth=1);
         self.style.map('TNotebook.Tab',background=[('selected',HEADER_ACTIVE_BG)],foreground=[('selected',HEADER_ACTIVE_TEXT)],expand=[('selected',[1,1,1,1])])
-        self.style.configure('TProgressbar',thickness=20,background=STATUS_SUCCESS_FG,troughcolor=WIDGET_BG); self.style.configure('Vertical.TScrollbar', background=BUTTON_BG, troughcolor=WIDGET_BG, bordercolor=BUTTON_BORDER, arrowcolor=TEXT_COLOR); 
+        self.style.configure('TProgressbar',thickness=20,background=STATUS_SUCCESS_FG,troughcolor=WIDGET_BG); self.style.configure('Vertical.TScrollbar', background=BUTTON_BG, troughcolor=WIDGET_BG, bordercolor=BUTTON_BORDER, arrowcolor=TEXT_COLOR);
         self.style.map('Vertical.TScrollbar', background=[('active', BUTTON_ACTIVE_BG)])
         self.style.configure('Treeview', background=WIDGET_BG, fieldbackground=WIDGET_BG, foreground=TEXT_COLOR)
         self.style.map('Treeview', background=[('selected', HIGHLIGHT_BG)], foreground=[('selected', HIGHLIGHT_TEXT)])
         self.style.configure('Treeview.Heading', background=HEADER_BG, foreground=HEADER_TEXT, font=self.bold_font, padding=5)
         self.style.map('Treeview.Heading', background=[('active', HEADER_ACTIVE_BG)])
-        self.style.configure('file_replaced', foreground='#FFA500', font=self.bold_font) 
+        self.style.configure('file_replaced', foreground='#FFA500', font=self.bold_font)
 
 
     def _create_dir_input(self, parent, label, row, var_name, pady_override=None):
         pady_val = (10,2) if pady_override is None else pady_override
         ttk.Label(parent, text=label, style='Header.TLabel').grid(row=row, column=0, sticky='w', padx=5, pady=pady_val);
         frame=ttk.Frame(parent); frame.grid(row=row+1, column=0, sticky='ew', padx=5, pady=(0,10)); frame.grid_columnconfigure(0, weight=1)
-        v=tk.StringVar(); setattr(self, var_name, v); e=ttk.Entry(frame, textvariable=v, width=60); e.grid(row=0, column=0, sticky='ew', padx=(0,10)); 
+        v=tk.StringVar(); setattr(self, var_name, v); e=ttk.Entry(frame, textvariable=v, width=60); e.grid(row=0, column=0, sticky='ew', padx=(0,10));
         b=ttk.Button(frame, text="Browse...", command=lambda v_arg=v: self._select_directory(v_arg)); b.grid(row=0, column=1); return v
 
     def _create_file_output_input(self, parent, label, row, var_name, original_arc_filepath_var, pady_override=None):
@@ -1975,8 +1948,8 @@ class ArcToolApp:
             initial_dir = os.path.dirname(original_arc_path)
             initial_file = os.path.basename(original_arc_path)
         else:
-            initial_dir = os.getcwd() 
-            initial_file = "rebuilt_arc.arc" 
+            initial_dir = os.getcwd()
+            initial_file = "rebuilt_arc.arc"
 
         filepath = filedialog.asksaveasfilename(
             title="Select Output Rebuilt ARC File",
@@ -1990,7 +1963,7 @@ class ArcToolApp:
 
 
     def create_list_extract_widgets(self):
-        frame=self.list_extract_frame; frame.grid_columnconfigure(0, weight=1); frame.grid_rowconfigure(1, weight=1); ttk.Label(frame, text="Input ARC Files:", style='Header.TLabel').grid(row=0, column=0, columnspan=3, sticky='w', pady=(10,5)) 
+        frame=self.list_extract_frame; frame.grid_columnconfigure(0, weight=1); frame.grid_rowconfigure(1, weight=1); ttk.Label(frame, text="Input ARC Files:", style='Header.TLabel').grid(row=0, column=0, columnspan=3, sticky='w', pady=(10,5))
         lb_frame = ttk.Frame(frame); lb_frame.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky='nsew'); lb_frame.grid_rowconfigure(0, weight=1); lb_frame.grid_columnconfigure(0, weight=1)
         self.list_extract_listbox=tk.Listbox(lb_frame, width=80, height=10, selectmode=tk.EXTENDED); self.list_extract_listbox.grid(row=0, column=0, sticky='nsew'); sb=ttk.Scrollbar(lb_frame, orient='vertical', command=self.list_extract_listbox.yview, style='Vertical.TScrollbar'); sb.grid(row=0, column=1, sticky='nsw'); self.list_extract_listbox.config(yscrollcommand=sb.set)
         bf=ttk.Frame(frame); bf.grid(row=2, column=0, columnspan=2, sticky='ew', padx=5, pady=5); ttk.Button(bf, text="Select Files", command=self.select_list_extract_files).pack(side=tk.LEFT, padx=(0,10), pady=5); ttk.Button(bf, text="Clear List", command=lambda: self.list_extract_listbox.delete(0, tk.END)).pack(side=tk.LEFT, padx=(0,10), pady=5)
@@ -1998,7 +1971,7 @@ class ArcToolApp:
 
     def create_list_inject_widgets(self):
         frame=self.list_inject_frame; frame.grid_columnconfigure(0, weight=1); frame.grid_rowconfigure(1, weight=1); ttk.Label(frame, text="Input Source Folders:", style='Header.TLabel').grid(row=0, column=0, columnspan=3, sticky='w', pady=(10,5))
-        lb_frame = ttk.Frame(frame); lb_frame.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky='nsew'); lb_frame.grid_rowconfigure(0, weight=1); lb_frame.grid_columnconfigure(0, weight=1) 
+        lb_frame = ttk.Frame(frame); lb_frame.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky='nsew'); lb_frame.grid_rowconfigure(0, weight=1); lb_frame.grid_columnconfigure(0, weight=1)
         self.list_inject_listbox=tk.Listbox(lb_frame, width=80, height=10, selectmode=tk.EXTENDED); self.list_inject_listbox.grid(row=0, column=0, sticky='nsew'); sb=ttk.Scrollbar(lb_frame, orient='vertical', command=self.list_inject_listbox.yview, style='Vertical.TScrollbar'); sb.grid(row=0, column=1, sticky='nsw'); self.list_inject_listbox.config(yscrollcommand=sb.set)
         bf=ttk.Frame(frame); bf.grid(row=2, column=0, columnspan=2, sticky='ew', padx=5, pady=5); ttk.Button(bf, text="Add Folder", command=self.select_list_inject_folders).pack(side=tk.LEFT, padx=(0,10), pady=5); ttk.Button(bf, text="Clear List", command=lambda: self.list_inject_listbox.delete(0, tk.END)).pack(side=tk.LEFT, padx=(0,10), pady=5)
         self._create_dir_input(frame, "Output Rebuilt ARC Directory:", 3, "list_inject_output_var"); ttk.Button(frame, text="Start Rebuild", command=self.start_list_injection).grid(row=5, column=0, columnspan=3, pady=(10,10))
@@ -2035,7 +2008,7 @@ class ArcToolApp:
 
         tree_frame = ttk.Frame(frame);
         tree_frame.grid(row=1, column=0, sticky='nsew', pady=(2,0))
-        tree_frame.grid_rowconfigure(0, minsize=250,  weight=1); 
+        tree_frame.grid_rowconfigure(0, minsize=250,  weight=1);
         tree_frame.grid_columnconfigure(0, weight=1, minsize=200)
 
         self.internal_arc_tree = ttk.Treeview(tree_frame, columns=("fullpath", "type", "size"), displaycolumns=(), show="tree")
@@ -2063,10 +2036,10 @@ class ArcToolApp:
         self._create_dir_input(output_frame, "Output Directory for Selected Items:", 0, "internal_extract_output_var")
         ttk.Button(frame, text="Extract Selected Items", command=self.start_internal_arc_extraction).grid(row=3, column=0, pady=(10,10), padx=5)
 
-    def create_internal_arc_inject_widgets(self): 
+    def create_internal_arc_inject_widgets(self):
         frame = self.internal_arc_inject_frame
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(1, weight=1) 
+        frame.grid_rowconfigure(1, weight=1)
 
         input_arc_frame = ttk.Frame(frame); input_arc_frame.grid(row=0, column=0, sticky='ew', padx=5, pady=(0,2))
         input_arc_frame.grid_columnconfigure(0, weight=1)
@@ -2097,7 +2070,7 @@ class ArcToolApp:
         self.internal_inject_tree.bind("<<TreeviewSelect>>", self.on_internal_inject_tree_selection_changed)
 
         buttons_frame = ttk.Frame(tree_and_buttons_frame);
-        buttons_frame.grid(row=0, column=2, sticky='n', padx=(10,0)) 
+        buttons_frame.grid(row=0, column=2, sticky='n', padx=(10,0))
         self.replace_file_button = ttk.Button(buttons_frame, text="Replace Selected File...", command=self.replace_selected_internal_file, state=tk.DISABLED)
         self.replace_file_button.pack(pady=(5,5), fill='x')
         self.clear_injection_map_button = ttk.Button(buttons_frame, text="Clear Replacements", command=self.clear_internal_inject_map)
@@ -2106,7 +2079,7 @@ class ArcToolApp:
         output_frame = ttk.Frame(frame);
         output_frame.grid(row=2, column=0, sticky='ews', pady=(2,0))
         self._create_file_output_input(output_frame, "Output Rebuilt ARC File (New Name/Location):", 0, "internal_inject_output_var", self.internal_inject_filepath_var)
-        
+
         info_text = "Select an existing ARC, then pick files to replace. Retains original ARC structure and metadata."
         ttk.Label(frame, text=info_text, style='TLabel', justify=tk.LEFT).grid(row=3, column=0, sticky='w', padx=5, pady=(10,5))
         ttk.Button(frame, text="Start Injection", command=self.start_internal_arc_injection).grid(row=4, column=0, pady=(10,10), padx=5)
@@ -2120,7 +2093,7 @@ class ArcToolApp:
         self.flatten_extract_frame.dnd_bind('<<Drop>>', self.handle_drop_flatten_extract)
 
         self.internal_arc_extract_frame.drop_target_register(DND_FILES)
-        self.internal_arc_extract_frame.dnd_bind('<<Drop>>', self.handle_drop_internal_arc_extract) 
+        self.internal_arc_extract_frame.dnd_bind('<<Drop>>', self.handle_drop_internal_arc_extract)
 
         self.internal_arc_inject_frame.drop_target_register(DND_FILES)
         self.internal_arc_inject_frame.dnd_bind('<<Drop>>', self.handle_drop_internal_arc_inject)
@@ -2145,12 +2118,12 @@ class ArcToolApp:
                     if fp_str not in current_items:
                         self.list_extract_listbox.insert(tk.END, fp_str)
                         new_files_added_count += 1
-            
+
             if new_files_added_count > 0:
                 self.add_status_message(f"D&D: Added {new_files_added_count} ARC file(s) to 'Extract Arc Files' list.", STATUS_INFO)
             elif not any(fp.suffix.lower() == '.arc' for fp in filepaths):
                  self.add_status_message("D&D: No .arc files found in dropped items for 'Extract Arc Files'.", STATUS_WARN)
-            self.notebook.select(self.list_extract_frame) 
+            self.notebook.select(self.list_extract_frame)
         except Exception as e:
             self.add_status_message(f"Error during D&D for List Extract: {e}", STATUS_ERROR)
             traceback.print_exc(file=sys.stderr)
@@ -2162,7 +2135,7 @@ class ArcToolApp:
             for fp in filepaths:
                 if fp.is_file() and fp.suffix.lower() == '.arc':
                     dropped_arc_file_path = str(fp)
-                    break 
+                    break
 
             if not dropped_arc_file_path:
                 self.add_status_message("D&D: No .arc file dropped or found for 'Extract All (Flatten)'.", STATUS_WARN)
@@ -2173,7 +2146,7 @@ class ArcToolApp:
                 messagebox.showwarning("Output Missing", "Please select an output directory for the flattened files before dropping an ARC.")
                 self.add_status_message("D&D Flatten: Output directory not set.", STATUS_ERROR)
                 return
-            
+
             if not pathlib.Path(output_dir).is_dir():
                 try:
                     pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -2183,22 +2156,22 @@ class ArcToolApp:
                     return
 
             self.add_status_message(f"D&D Flatten: Processing '{os.path.basename(dropped_arc_file_path)}' into '{output_dir}'.", STATUS_INFO)
-            self._run_task(run_batch_parallel, 
+            self._run_task(run_batch_parallel,
                            args_tuple=(_flatten_extract_worker, [dropped_arc_file_path], output_dir))
-            self.notebook.select(self.flatten_extract_frame) 
+            self.notebook.select(self.flatten_extract_frame)
         except Exception as e:
             self.add_status_message(f"Error during D&D for Flatten Extract: {e}", STATUS_ERROR)
             traceback.print_exc(file=sys.stderr)
 
-    def handle_drop_internal_arc_extract(self, event): 
+    def handle_drop_internal_arc_extract(self, event):
         try:
             filepaths = self._parse_dropped_files(event.data)
             dropped_arc_file_path = None
             for fp in filepaths:
                 if fp.is_file() and fp.suffix.lower() == '.arc':
                     dropped_arc_file_path = str(fp)
-                    break 
-            
+                    break
+
             if not dropped_arc_file_path:
                 self.add_status_message("D&D: No .arc file dropped or found for 'Internal-ARC Extraction'.", STATUS_WARN)
                 return
@@ -2206,20 +2179,20 @@ class ArcToolApp:
             self.internal_arc_filepath_var.set(dropped_arc_file_path)
             self.load_arc_into_treeview(dropped_arc_file_path)
             self.add_status_message(f"D&D: Loaded '{os.path.basename(dropped_arc_file_path)}' for internal preview.", STATUS_INFO)
-            self.notebook.select(self.internal_arc_extract_frame) 
+            self.notebook.select(self.internal_arc_extract_frame)
         except Exception as e:
             self.add_status_message(f"Error during D&D for Internal ARC: {e}", STATUS_ERROR)
             traceback.print_exc(file=sys.stderr)
-            
-    def handle_drop_internal_arc_inject(self, event): 
+
+    def handle_drop_internal_arc_inject(self, event):
         try:
             filepaths = self._parse_dropped_files(event.data)
             dropped_arc_file_path = None
             for fp in filepaths:
                 if fp.is_file() and fp.suffix.lower() == '.arc':
                     dropped_arc_file_path = str(fp)
-                    break 
-            
+                    break
+
             if not dropped_arc_file_path:
                 self.add_status_message("D&D: No .arc file dropped or found for 'Internal-ARC Injection'.", STATUS_WARN)
                 return
@@ -2227,7 +2200,7 @@ class ArcToolApp:
             self.internal_inject_filepath_var.set(dropped_arc_file_path)
             self.load_arc_into_inject_treeview(dropped_arc_file_path)
             self.add_status_message(f"D&D: Loaded '{os.path.basename(dropped_arc_file_path)}' for internal injection.", STATUS_INFO)
-            self.notebook.select(self.internal_arc_inject_frame) 
+            self.notebook.select(self.internal_arc_inject_frame)
         except Exception as e:
             self.add_status_message(f"Error during D&D for Internal ARC Injection: {e}", STATUS_ERROR)
             traceback.print_exc(file=sys.stderr)
@@ -2255,86 +2228,88 @@ class ArcToolApp:
             self.internal_arc_filepath_var.set(filepath)
             self.load_arc_into_treeview(filepath)
 
-    def select_internal_inject_arc_file(self): 
+    def select_internal_inject_arc_file(self):
         filepath = filedialog.askopenfilename(title="Select ARC File to Inject Into", filetypes=[("MT ARC","*.arc"),("All Files","*.*")])
         if filepath:
             self.internal_inject_filepath_var.set(filepath)
             self.load_arc_into_inject_treeview(filepath)
 
     def load_arc_into_treeview(self, filepath):
-        self.internal_arc_tree.delete(*self.internal_arc_tree.get_children()) 
+        self.internal_arc_tree.delete(*self.internal_arc_tree.get_children())
         self.tree_item_data.clear()
         self.current_arc_for_internal_view = MTArc()
         try:
-            self.current_arc_for_internal_view.load(filepath, status_queue=self.queue)
+            # Pass self.queue_status for MTArc.load, it will adapt.
+            self.current_arc_for_internal_view.load(filepath, status_queue_or_callback=self.queue_status)
             self.add_status_message(f"Loaded ARC '{os.path.basename(filepath)}' with {len(self.current_arc_for_internal_view.files)} entries.", STATUS_INFO)
-            
+
             folder_iids = {}
             sorted_files = sorted(self.current_arc_for_internal_view.files, key=lambda fi: fi['full_filename'].replace('\\', '/'))
 
             for file_info in sorted_files:
-                full_path = file_info['full_filename'].replace('\\', '/') 
+                full_path = file_info['full_filename'].replace('\\', '/')
                 parts = full_path.split('/')
-                current_parent_iid_for_insert = '' 
+                current_parent_iid_for_insert = ''
                 path_accumulator = []
 
-                for i, part_name in enumerate(parts[:-1]): 
+                for i, part_name in enumerate(parts[:-1]):
                     path_accumulator.append(part_name)
                     current_folder_path_str = "/".join(path_accumulator)
-                    
+
                     if current_folder_path_str not in folder_iids:
                         iid = self.internal_arc_tree.insert(
-                            current_parent_iid_for_insert, 
-                            'end', 
-                            text=f"{CHECK_UNCHECKED} {part_name}", 
-                            values=(current_folder_path_str, "folder", 0), 
-                            tags=('folder_unchecked_color',), 
+                            current_parent_iid_for_insert,
+                            'end',
+                            text=f"{CHECK_UNCHECKED} {part_name}",
+                            values=(current_folder_path_str, "folder", 0),
+                            tags=('folder_unchecked_color',),
                             open=False
                         )
                         folder_iids[current_folder_path_str] = iid
                         self.tree_item_data[iid] = {
-                            'path': current_folder_path_str, 'is_folder': True, 
+                            'path': current_folder_path_str, 'is_folder': True,
                             'checked_state': False, 'file_info': None,
-                            'display_name': part_name 
+                            'display_name': part_name
                         }
-                        current_parent_iid_for_insert = iid 
+                        current_parent_iid_for_insert = iid
                     else:
                         current_parent_iid_for_insert = folder_iids[current_folder_path_str]
-                
+
                 file_name_only = parts[-1]
                 file_iid = self.internal_arc_tree.insert(
-                    current_parent_iid_for_insert, 
+                    current_parent_iid_for_insert,
                     'end',
                     text=f"{CHECK_UNCHECKED} {file_name_only}",
                     values=(full_path, "file", file_info.get('calculated_uncompressed_size',0)),
-                    tags=('file_unchecked_color',), 
+                    tags=('file_unchecked_color',),
                     open=False
                 )
                 self.tree_item_data[file_iid] = {
-                    'path': full_path, 'is_folder': False, 
+                    'path': full_path, 'is_folder': False,
                     'checked_state': False, 'file_info': file_info,
                     'display_name': file_name_only
                 }
-        except ARCCSkippedError as e: 
+        except ARCCSkippedError as e:
+            # Status already sent by MTArc.load via queue_status
             if self.current_arc_for_internal_view: self.current_arc_for_internal_view.close()
             self.current_arc_for_internal_view = None
-            return 
+            return
         except Exception as e:
             self.add_status_message(f"Error loading ARC for preview: {e}", STATUS_ERROR)
             traceback.print_exc(file=sys.stderr)
             if self.current_arc_for_internal_view: self.current_arc_for_internal_view.close()
             self.current_arc_for_internal_view = None
 
-    def load_arc_into_inject_treeview(self, filepath): 
+    def load_arc_into_inject_treeview(self, filepath):
         self.internal_inject_tree.delete(*self.internal_inject_tree.get_children())
         self.internal_inject_tree_item_data.clear()
-        self.files_to_inject_map.clear() 
+        self.files_to_inject_map.clear()
 
         self.current_arc_for_internal_inject_view = MTArc()
         try:
-            self.current_arc_for_internal_inject_view.load(filepath, status_queue=self.queue) 
+            self.current_arc_for_internal_inject_view.load(filepath, status_queue_or_callback=self.queue_status)
             self.add_status_message(f"Loaded ARC '{os.path.basename(filepath)}' for injection preview with {len(self.current_arc_for_internal_inject_view.files)} entries.", STATUS_INFO)
-            
+
             folder_iids = {}
             sorted_files = sorted(self.current_arc_for_internal_inject_view.files, key=lambda fi: fi['full_filename'].replace('\\', '/'))
 
@@ -2347,63 +2322,63 @@ class ArcToolApp:
                 for i, part_name in enumerate(parts[:-1]):
                     path_accumulator.append(part_name)
                     current_folder_path_str = "/".join(path_accumulator)
-                    
+
                     if current_folder_path_str not in folder_iids:
                         iid = self.internal_inject_tree.insert(
-                            current_parent_iid_for_insert, 
-                            'end', 
-                            text=part_name, 
-                            values=(current_folder_path_str, "folder", 0), 
-                            tags=('folder_unchecked_color',), 
+                            current_parent_iid_for_insert,
+                            'end',
+                            text=part_name,
+                            values=(current_folder_path_str, "folder", 0),
+                            tags=('folder_unchecked_color',),
                             open=False
                         )
                         folder_iids[current_folder_path_str] = iid
                         self.internal_inject_tree_item_data[iid] = {
-                            'path': current_folder_path_str, 'is_folder': True, 
+                            'path': current_folder_path_str, 'is_folder': True,
                             'file_info': None, 'display_name': part_name
                         }
                         current_parent_iid_for_insert = iid
                     else:
                         current_parent_iid_for_insert = folder_iids[current_folder_path_str]
-                
+
                 file_name_only = parts[-1]
                 file_iid = self.internal_inject_tree.insert(
-                    current_parent_iid_for_insert, 
+                    current_parent_iid_for_insert,
                     'end',
                     text=file_name_only,
                     values=(full_path, "file", file_info.get('calculated_uncompressed_size',0)),
-                    tags=('file_unchecked_color',), 
+                    tags=('file_unchecked_color',),
                     open=False
                 )
                 self.internal_inject_tree_item_data[file_iid] = {
-                    'path': full_path, 'is_folder': False, 
+                    'path': full_path, 'is_folder': False,
                     'file_info': file_info, 'display_name': file_name_only
                 }
-            self.replace_file_button.config(state=tk.DISABLED) 
-        except ARCCSkippedError as e: 
+            self.replace_file_button.config(state=tk.DISABLED)
+        except ARCCSkippedError as e:
             if self.current_arc_for_internal_inject_view: self.current_arc_for_internal_inject_view.close()
             self.current_arc_for_internal_inject_view = None
             self.replace_file_button.config(state=tk.DISABLED)
-            return 
+            return
         except Exception as e:
             self.add_status_message(f"Error loading ARC for injection: {e}", STATUS_ERROR)
             traceback.print_exc(file=sys.stderr)
             if self.current_arc_for_internal_inject_view: self.current_arc_for_internal_inject_view.close()
             self.current_arc_for_internal_inject_view = None
 
-    def on_internal_inject_tree_selection_changed(self, event): 
+    def on_internal_inject_tree_selection_changed(self, event):
         selected_items = self.internal_inject_tree.selection()
         if len(selected_items) == 1:
             item_iid = selected_items[0]
             item_data = self.internal_inject_tree_item_data.get(item_iid)
-            if item_data and not item_data['is_folder']: 
+            if item_data and not item_data['is_folder']:
                 self.replace_file_button.config(state=tk.NORMAL)
             else:
                 self.replace_file_button.config(state=tk.DISABLED)
         else:
             self.replace_file_button.config(state=tk.DISABLED)
 
-    def replace_selected_internal_file(self): 
+    def replace_selected_internal_file(self):
         selected_items = self.internal_inject_tree.selection()
         if not selected_items or len(selected_items) != 1: return
 
@@ -2419,16 +2394,16 @@ class ArcToolApp:
 
         new_disk_file_path = filedialog.askopenfilename(
             title=f"Select replacement for '{original_display_name}'",
-            filetypes=[("All Files", "*.*")] 
+            filetypes=[("All Files", "*.*")]
         )
         if new_disk_file_path:
             self.files_to_inject_map[internal_arc_path.lower().replace('\\', '/')] = new_disk_file_path
-            
+
             new_text = f"{original_display_name} (REPLACED by {os.path.basename(new_disk_file_path)})"
             self.internal_inject_tree.item(item_iid, text=new_text, tags=('file_replaced',))
             self.add_status_message(f"Marked '{original_display_name}' for replacement with '{os.path.basename(new_disk_file_path)}'.", STATUS_INFO)
 
-    def clear_internal_inject_map(self): 
+    def clear_internal_inject_map(self):
         if messagebox.askyesno("Clear Replacements", "Are you sure you want to clear all marked file replacements?"):
             self.files_to_inject_map.clear()
             self.add_status_message("All pending file replacements have been cleared.", STATUS_INFO)
@@ -2446,7 +2421,7 @@ class ArcToolApp:
         if "indicator" in element_str_lower or \
            "expander" in element_str_lower or \
            "arrow" in element_str_lower:
-            return 
+            return
 
         if item_iid not in self.tree_item_data:
             return
@@ -2460,26 +2435,26 @@ class ArcToolApp:
             return
 
         current_data = self.tree_item_data[item_iid]
-        
+
         original_display_name_key = 'display_name'
-        if original_display_name_key not in current_data: 
+        if original_display_name_key not in current_data:
             current_text_from_tree = self.internal_arc_tree.item(item_iid, 'text')
             if current_text_from_tree:
                 parts = current_text_from_tree.split(" ", 1)
                 if len(parts) > 1:
                     current_data[original_display_name_key] = parts[1]
-                else: 
-                    current_data[original_display_name_key] = current_text_from_tree 
-            else: 
+                else:
+                    current_data[original_display_name_key] = current_text_from_tree
+            else:
                 current_data[original_display_name_key] = "ErrorName"
 
-        current_data['checked_state'] = checked 
+        current_data['checked_state'] = checked
         item_display_name = current_data.get(original_display_name_key, "Unknown")
 
         checkbox_char = CHECK_CHECKED if checked else CHECK_UNCHECKED
         new_text = f"{checkbox_char} {item_display_name}"
         self.internal_arc_tree.item(item_iid, text=new_text)
-        
+
         tag_to_apply = ""
         is_folder = current_data['is_folder']
 
@@ -2487,13 +2462,13 @@ class ArcToolApp:
             tag_to_apply = 'folder_checked_color' if is_folder else 'file_checked_color'
         else:
             tag_to_apply = 'folder_unchecked_color' if is_folder else 'file_unchecked_color'
-        
-        self.internal_arc_tree.item(item_iid, tags=(tag_to_apply,)) 
-        
+
+        self.internal_arc_tree.item(item_iid, tags=(tag_to_apply,))
+
         if recursive and is_folder:
             for child_iid in self.internal_arc_tree.get_children(item_iid):
                 self._set_tree_item_checked_state(child_iid, checked, recursive=True, update_parent=False)
-        
+
         if update_parent:
             parent_iid = self.internal_arc_tree.parent(item_iid)
             if parent_iid:
@@ -2507,11 +2482,11 @@ class ArcToolApp:
         parent_data = self.tree_item_data[parent_iid]
         current_parent_checked_state = parent_data['checked_state']
 
-        if not children_iids: 
+        if not children_iids:
             return
 
         all_children_now_fully_checked = True
-        any_child_checked = False 
+        any_child_checked = False
 
         for child_iid in children_iids:
             if child_iid in self.tree_item_data:
@@ -2520,44 +2495,44 @@ class ArcToolApp:
                     all_children_now_fully_checked = False
                 if child_data['checked_state']:
                     any_child_checked = True
-            else: 
-                all_children_now_fully_checked = False 
-        
-        new_parent_checked_state = current_parent_checked_state 
+            else:
+                all_children_now_fully_checked = False
 
-        if current_parent_checked_state: 
+        new_parent_checked_state = current_parent_checked_state
+
+        if current_parent_checked_state:
             if not all_children_now_fully_checked:
-                new_parent_checked_state = False 
-        else: 
-            pass 
-            
+                new_parent_checked_state = False
+        else:
+            pass
+
         if current_parent_checked_state != new_parent_checked_state:
             self._set_tree_item_checked_state(parent_iid, new_parent_checked_state, recursive=False, update_parent=True)
 
     def _run_task(self, target_func, args_tuple=(), kwargs_dict=None,
                   original_arc_params_list=None,
-                  target_is_arcc_list=None, 
+                  target_is_arcc_list=None,
                   original_file_orders_list=None,
                   original_file_metadata_map_list=None):
-        k1, k2 = None, None 
+        k1, k2 = None, None
 
         if kwargs_dict is None: kwargs_dict = {}
 
         kwargs_dict['progress_callback'] = self.update_progress
-        kwargs_dict['status_callback'] = self.queue_status
+        kwargs_dict['status_callback'] = self.queue_status # For GUI, this puts onto app.queue
         kwargs_dict['key1'] = k1
         kwargs_dict['key2'] = k2
 
         if target_func == run_batch_parallel:
             kwargs_dict['original_arc_params_list'] = original_arc_params_list
-            kwargs_dict['target_is_arcc_list'] = target_is_arcc_list 
+            kwargs_dict['target_is_arcc_list'] = target_is_arcc_list
             kwargs_dict['original_file_orders_list'] = original_file_orders_list
             kwargs_dict['original_file_metadata_map_list'] = original_file_metadata_map_list
 
         self.progress_var.set(0)
 
         task_name_display = target_func.__name__.replace('_', ' ').replace('run batch parallel', '').strip().title()
-        if args_tuple and hasattr(args_tuple[0], '__name__'): 
+        if args_tuple and hasattr(args_tuple[0], '__name__'):
             worker_name = args_tuple[0].__name__
             if worker_name == '_list_extract_worker': task_name_display = "List Extraction"
             elif worker_name == '_list_inject_worker': task_name_display = "List Injection"
@@ -2565,7 +2540,7 @@ class ArcToolApp:
         elif target_func == recursive_batch_extract: task_name_display = "Recursive Extraction"
         elif target_func == folder_batch_inject: task_name_display = "Folder In-Place Injection"
         elif target_func == self._perform_internal_arc_extraction_thread: task_name_display = "Internal ARC Extraction"
-        elif target_func == self._perform_internal_arc_injection_thread: task_name_display = "Internal ARC Injection" 
+        elif target_func == self._perform_internal_arc_injection_thread: task_name_display = "Internal ARC Injection"
 
 
         self.add_status_message(f"Starting {task_name_display} task...", STATUS_INFO);
@@ -2575,10 +2550,10 @@ class ArcToolApp:
     def start_list_extraction(self):
         items = self.list_extract_listbox.get(0, tk.END);
         if not items: messagebox.showwarning("Input Missing","Please select one or more ARC files for extraction."); return;
-        self._run_task(run_batch_parallel, (_list_extract_worker, items, None)) 
+        self._run_task(run_batch_parallel, (_list_extract_worker, items, None))
 
     def start_list_injection(self):
-        items_folder_paths_str = self.list_extract_listbox.get(0, tk.END)
+        items_folder_paths_str = self.list_inject_listbox.get(0, tk.END) # Corrected from list_extract_listbox
         output_rebuilt_dir_str = self.list_inject_output_var.get()
 
         if not items_folder_paths_str:
@@ -2593,10 +2568,10 @@ class ArcToolApp:
                 messagebox.showerror("Input Invalid", f"Source folder not found or is not a directory: {folder_path_str_val}")
                 return
 
-        all_original_arc_params_dicts = [] 
-        all_target_is_arcc_flags = []    
-        all_original_file_orders = []    
-        all_original_file_metadata_maps = [] 
+        all_original_arc_params_dicts = []
+        all_target_is_arcc_flags = []
+        all_original_file_orders = []
+        all_original_file_metadata_maps = []
 
         self.add_status_message("Preparing parameters for List Injection...", STATUS_INFO)
 
@@ -2605,14 +2580,14 @@ class ArcToolApp:
             "platform": DEFAULT_PLATFORM,
             "bo_char": DEFAULT_BYTE_ORDER_CHAR,
             "file_order": None,
-            "entry_has_extended_names": False, 
-            "original_file_metadata_map": {} 
+            "entry_has_extended_names": False,
+            "original_file_metadata_map": {}
         }
 
         for folder_path_str_item in items_folder_paths_str:
             folder_path_obj_item = pathlib.Path(folder_path_str_item)
             current_params_for_item = default_params_values.copy()
-            
+
             if folder_path_obj_item.name.endswith("_arc"):
                 arc_basename_item = folder_path_obj_item.name[:-4]
                 potential_original_arc_path_item = folder_path_obj_item.parent / (arc_basename_item + ".arc")
@@ -2620,14 +2595,11 @@ class ArcToolApp:
                 if potential_original_arc_path_item.is_file():
                     self.add_status_message(f"Found potential original ARC '{potential_original_arc_path_item.name}' for folder '{folder_path_obj_item.name}'. Attempting to load parameters...", STATUS_DEBUG)
                     temp_arc_loader_item = MTArc()
-                    temp_load_status_queue_item = queue.Queue() 
                     try:
-                        temp_arc_loader_item.load(str(potential_original_arc_path_item), status_queue=temp_load_status_queue_item) 
-                        while not temp_load_status_queue_item.empty():
-                            msg_item_load = temp_load_status_queue_item.get_nowait()
-                            self.queue_status(f"(Param scan for {potential_original_arc_path_item.name}) {msg_item_load['msg']}", msg_item_load['level'])
+                        # Pass self.queue_status (which puts on app.queue)
+                        temp_arc_loader_item.load(str(potential_original_arc_path_item), status_queue_or_callback=self.queue_status)
 
-                        if temp_arc_loader_item.arc_header: 
+                        if temp_arc_loader_item.arc_header:
                             file_meta_map_item = {}
                             if temp_arc_loader_item.files:
                                 for fi_orig_item in temp_arc_loader_item.files:
@@ -2636,7 +2608,7 @@ class ArcToolApp:
                                         'is_compressed': fi_orig_item['is_compressed'],
                                         'uncompressed_size_raw': fi_orig_item['uncompressed_size_raw']
                                     }
-                            
+
                             current_params_for_item.update({
                                 "version": temp_arc_loader_item.version,
                                 "platform": temp_arc_loader_item.platform,
@@ -2650,7 +2622,6 @@ class ArcToolApp:
                             self.add_status_message(f"Failed to load header from '{potential_original_arc_path_item.name}'. Using default parameters for '{folder_path_obj_item.name}'.", STATUS_WARN)
                     except ARCCSkippedError:
                          self.add_status_message(f"Info: Original ARC '{potential_original_arc_path_item.name}' is an ARCC and was skipped. Using default parameters for '{folder_path_obj_item.name}'.", STATUS_INFO)
-                         # current_params_for_item remains default_params_values
                     except Exception as e_load_params_item:
                         self.add_status_message(f"Error loading parameters from '{potential_original_arc_path_item.name}' for '{folder_path_obj_item.name}': {e_load_params_item}. Using defaults.", STATUS_WARN)
                     finally:
@@ -2667,14 +2638,14 @@ class ArcToolApp:
                 "entry_has_extended_names": current_params_for_item["entry_has_extended_names"]
             }
             all_original_arc_params_dicts.append(param_dict_for_worker_item)
-            all_target_is_arcc_flags.append(False) 
-            all_original_file_orders.append(current_params_for_item["file_order"]) 
+            all_target_is_arcc_flags.append(False)
+            all_original_file_orders.append(current_params_for_item["file_order"])
             all_original_file_metadata_maps.append(current_params_for_item["original_file_metadata_map"])
 
-        self._run_task(run_batch_parallel, 
+        self._run_task(run_batch_parallel,
                        args_tuple=(_list_inject_worker, items_folder_paths_str, output_rebuilt_dir_str),
                        original_arc_params_list=all_original_arc_params_dicts,
-                       target_is_arcc_list=all_target_is_arcc_flags, 
+                       target_is_arcc_list=all_target_is_arcc_flags,
                        original_file_orders_list=all_original_file_orders,
                        original_file_metadata_map_list=all_original_file_metadata_maps)
 
@@ -2682,7 +2653,7 @@ class ArcToolApp:
     def start_recursive_extraction(self):
         src = self.rec_extract_source_var.get();
         if not src: messagebox.showwarning("Input Missing","Please select a source directory containing ARC files."); return
-        self._run_task(recursive_batch_extract, (src, None)) 
+        self._run_task(recursive_batch_extract, (src, None))
 
     def start_folder_injection(self):
         src_dir = self.folder_inject_source_dir_var.get();
@@ -2713,7 +2684,7 @@ class ArcToolApp:
                 messagebox.showerror("Output Error", f"Cannot create output directory '{output_dir}': {e}")
                 return
 
-        selected_items_for_extraction = [] 
+        selected_items_for_extraction = []
 
         def find_selected_dfs(item_iid, current_output_base_folder_name, current_arc_base_path):
             item_node_data = self.tree_item_data.get(item_iid)
@@ -2724,30 +2695,30 @@ class ArcToolApp:
             if is_explicitly_checked and item_node_data['is_folder']:
                 new_output_base_folder_name = pathlib.Path(item_node_data['path']).name
                 new_arc_base_path = item_node_data['path']
-            else: 
+            else:
                 new_output_base_folder_name = current_output_base_folder_name
                 new_arc_base_path = current_arc_base_path
 
             if item_node_data['is_folder']:
                 for child_iid in self.internal_arc_tree.get_children(item_iid):
                     find_selected_dfs(child_iid, new_output_base_folder_name, new_arc_base_path)
-            else: 
-                if is_explicitly_checked or new_arc_base_path: 
+            else:
+                if is_explicitly_checked or new_arc_base_path:
                     file_info = item_node_data['file_info']
                     arc_file_full_path_str = file_info['full_filename'].replace('\\', '/')
 
                     target_disk_path = None
-                    if new_arc_base_path: 
+                    if new_arc_base_path:
                         relative_path_in_arc = pathlib.Path(arc_file_full_path_str).relative_to(pathlib.Path(new_arc_base_path))
                         target_disk_path = pathlib.Path(output_dir) / new_output_base_folder_name / relative_path_in_arc
-                    elif is_explicitly_checked: 
+                    elif is_explicitly_checked:
                          target_disk_path = pathlib.Path(output_dir) / pathlib.Path(arc_file_full_path_str).name
 
                     if target_disk_path:
                         selected_items_for_extraction.append((file_info, target_disk_path))
 
         for root_iid in self.internal_arc_tree.get_children(''):
-            find_selected_dfs(root_iid, "", "") 
+            find_selected_dfs(root_iid, "", "")
 
         if not selected_items_for_extraction:
             messagebox.showinfo("Nothing Selected", "No files or folders are checked for extraction.")
@@ -2770,16 +2741,17 @@ class ArcToolApp:
 
 
     def _perform_internal_arc_extraction_thread(self, items_to_extract, arc_filepath_str,
-                                                progress_callback, status_callback, key1, key2): 
-        arc_for_extraction = None 
-        try: 
+                                                progress_callback, status_callback, key1, key2):
+        arc_for_extraction = None
+        try:
             if not self.current_arc_for_internal_view or self.current_arc_for_internal_view._raw_file_path != arc_filepath_str:
                 status_callback(f"Re-opening ARC '{os.path.basename(arc_filepath_str)}' for extraction...", STATUS_DEBUG)
                 arc_for_extraction = MTArc()
-                arc_for_extraction.load(arc_filepath_str, key1=key1, key2=key2, status_queue=self.queue)
+                # For GUI calls, status_callback is self.queue_status, which uses app.queue
+                arc_for_extraction.load(arc_filepath_str, key1=key1, key2=key2, status_queue_or_callback=status_callback)
             else:
                 arc_for_extraction = self.current_arc_for_internal_view
-            
+
             total_items = len(items_to_extract)
             processed_count = 0
             error_count = 0
@@ -2805,32 +2777,34 @@ class ArcToolApp:
                         (STATUS_WARN if processed_count > 0 else STATUS_ERROR)
             status_callback(final_msg, final_level)
 
-        except ARCCSkippedError as e: 
-            progress_callback(100) 
-            if isinstance(arc_for_extraction, MTArc): arc_for_extraction.close()
-            return 
-        except Exception as e_load_extract: 
+        except ARCCSkippedError as e:
+            progress_callback(100)
+            if arc_for_extraction and arc_for_extraction != self.current_arc_for_internal_view:
+                 arc_for_extraction.close()
+            return
+        except Exception as e_load_extract:
             status_callback(f"Error during extraction setup for '{os.path.basename(arc_filepath_str)}': {e_load_extract}", STATUS_ERROR)
             progress_callback(100)
-            if isinstance(arc_for_extraction, MTArc): arc_for_extraction.close()
+            if arc_for_extraction and arc_for_extraction != self.current_arc_for_internal_view:
+                arc_for_extraction.close()
             return
         finally:
             if arc_for_extraction and arc_for_extraction != self.current_arc_for_internal_view:
                 arc_for_extraction.close()
 
-    def start_internal_arc_injection(self): 
+    def start_internal_arc_injection(self):
         if not self.current_arc_for_internal_inject_view or not self.current_arc_for_internal_inject_view.files:
             messagebox.showwarning("No ARC Loaded", "Please load an ARC file into the 'Internal-ARC Injection' preview first.")
             return
 
         original_arc_path = self.internal_inject_filepath_var.get()
-        output_arc_path = self.internal_inject_output_var.get() 
+        output_arc_path = self.internal_inject_output_var.get()
 
         if not output_arc_path:
             messagebox.showwarning("Output Missing", "Please select an output path for the rebuilt ARC file.")
             return
 
-        if not original_arc_path: 
+        if not original_arc_path:
             messagebox.showerror("Internal Error", "Original ARC file path is missing. Please reload the ARC.")
             return
 
@@ -2862,14 +2836,14 @@ class ArcToolApp:
 
 
     def _perform_internal_arc_injection_thread(self, original_arc_filepath: str, files_to_inject_map: dict, output_arc_path: str,
-                                                progress_callback, status_callback, key1, key2): 
+                                                progress_callback, status_callback, key1, key2):
         arc_loader_for_read = None
         arc_saver_for_write = None
-        
+
         try:
-            status_callback(f"Attempting to load original ARC '{os.path.basename(original_arc_filepath)}'...", STATUS_DEBUG) 
+            status_callback(f"Attempting to load original ARC '{os.path.basename(original_arc_filepath)}'...", STATUS_DEBUG)
             arc_loader_for_read = MTArc()
-            arc_loader_for_read.load(original_arc_filepath, key1=key1, key2=key2, status_queue=self.queue) 
+            arc_loader_for_read.load(original_arc_filepath, key1=key1, key2=key2, status_queue_or_callback=status_callback)
 
             if not arc_loader_for_read.files:
                 status_callback(f"Original ARC '{os.path.basename(original_arc_filepath)}' contains no files. Cannot perform injection.", STATUS_ERROR)
@@ -2883,7 +2857,7 @@ class ArcToolApp:
             status_callback(f"Preparing {total_files} files for repack...", STATUS_INFO)
             for i, original_fi in enumerate(arc_loader_for_read.files):
                 full_filename_norm_lower = original_fi['full_filename'].lower().replace('\\', '/')
-                new_fi_for_save = original_fi.copy() 
+                new_fi_for_save = original_fi.copy()
 
                 data_source_description = ""
                 if full_filename_norm_lower in files_to_inject_map:
@@ -2903,7 +2877,7 @@ class ArcToolApp:
                     new_fi_for_save['original_is_compressed_hint'] = original_fi['is_compressed']
                     new_fi_for_save['original_uncompressed_size_raw_hint'] = original_fi['uncompressed_size_raw']
                     data_source_description = "original data"
-                
+
                 files_to_pack_for_save.append(new_fi_for_save)
                 processed_count += 1
                 status_callback(f"Processed file {i+1}/{total_files}: '{original_fi['full_filename']}' (using {data_source_description}).", STATUS_DEBUG)
@@ -2919,16 +2893,16 @@ class ArcToolApp:
             arc_saver_for_write.save(
                 output_arc_path,
                 files_to_pack_for_save,
-                key1=key1, key2=key2, 
+                key1=key1, key2=key2,
                 target_version=arc_loader_for_read.version,
                 target_platform=arc_loader_for_read.platform,
                 target_byte_order_char=arc_loader_for_read.byte_order_char,
-                target_is_arcc=False, 
+                target_is_arcc=False,
                 target_entry_has_extended_names=arc_loader_for_read.entry_has_extended_names
             )
             status_callback(f"Successfully rebuilt ARC to '{os.path.basename(output_arc_path)}'.", STATUS_SUCCESS)
 
-        except ARCCSkippedError as e: 
+        except ARCCSkippedError as e:
             progress_callback(100)
             if arc_loader_for_read: arc_loader_for_read.close()
             return
@@ -2939,7 +2913,7 @@ class ArcToolApp:
         finally:
             if arc_loader_for_read: arc_loader_for_read.close()
             if arc_saver_for_write: arc_saver_for_write.close()
-            progress_callback(100) 
+            progress_callback(100)
 
 
     def update_progress(self,v):
@@ -2990,20 +2964,20 @@ class ArcToolApp:
     def toggle_pop_out_log(self):
         if hasattr(self, 'log_is_popped_out') and self.log_is_popped_out: # Check if attribute exists
             if hasattr(self, 'log_toplevel_window') and self.log_toplevel_window:
-                self.status_text.grid_forget() 
+                self.status_text.grid_forget()
                 self.status_frame.pack(pady=(0,0), padx=10, fill='both', expand=True, side=tk.TOP, in_=self.bottom_pane_frame)
                 self.status_text.grid(row=0, column=0, sticky='nsew', in_=self.status_frame)
                 self.log_toplevel_window.destroy()
                 self.log_toplevel_window = None
             if hasattr(self, 'pop_log_button'): self.pop_log_button.config(text="↗ Pop Out Log")
             self.log_is_popped_out = False
-        else: 
+        else:
             self.log_toplevel_window = tk.Toplevel(self.root)
             self.log_toplevel_window.title("Log Output")
-            self.log_toplevel_window.geometry("800x400") 
+            self.log_toplevel_window.geometry("800x400")
             self.log_toplevel_window.grid_rowconfigure(0, weight=1)
             self.log_toplevel_window.grid_columnconfigure(0, weight=1)
-            self.status_text.grid_forget() 
+            self.status_text.grid_forget()
             self.status_frame.pack_forget()
             self.status_text.grid(row=0, column=0, sticky='nsew', in_=self.log_toplevel_window)
             if not hasattr(self, 'pop_log_button'): # Create button if it doesn't exist
@@ -3025,8 +2999,8 @@ class ArcToolApp:
             self.status_frame.pack(pady=(0,0), padx=10, fill='both', expand=True, side=tk.TOP, in_=self.bottom_pane_frame)
             self.status_text.grid(row=0, column=0, sticky='nsew', in_=self.status_frame)
             if hasattr(self, 'log_toplevel_window') and self.log_toplevel_window and self.log_toplevel_window.winfo_exists():
-                pass
-            self.log_toplevel_window = None 
+                pass # self.log_toplevel_window.destroy() is implicitly called by WM_DELETE_WINDOW
+            self.log_toplevel_window = None
             if hasattr(self, 'pop_log_button'): self.pop_log_button.config(text="↗ Pop Out Log")
             self.log_is_popped_out = False
 
@@ -3046,23 +3020,23 @@ class ArcToolApp:
            - Add one or more source folders to the list. These folders contain files you want to pack into ARCs.
            - Select an output directory where the new .arc files will be saved.
            - Each source folder is rebuilt into a new .arc file ('hotdog' becomes 'hotdog.arc').
-           - If a folder is named 'myarc_arc' and 'myarc.arc' exists in the same directory, 
-           parameters (version, platform, file order, etc.) from 'myarc.arc' will be used for the rebuild. 
+           - If a folder is named 'myarc_arc' and 'myarc.arc' exists in the same directory,
+           parameters (version, platform, file order, etc.) from 'myarc.arc' will be used for the rebuild.
            - Otherwise, default parameters are used.
 
         3. Recursive Extract Arcs:
            - Select a root directory.
            - The tool will scan this directory and all its subdirectories for .arc files.
-           - Each found .arc file is extracted similarly to 'Extract Arc Files (List)' 
+           - Each found .arc file is extracted similarly to 'Extract Arc Files (List)'
            (into its own subfolder, next to the ARC).
 
         4. Recursive Inject (In-Place):
-           - Select a root directory that contains both original .arc files and 
+           - Select a root directory that contains both original .arc files and
            corresponding unpacked/edited folders (typically named 'original_arc_name_arc').
            - The tool matches *_arc folders with their .arc files.
            - Original .arc files are backed up into an 'original_arc_backups' subfolder (created within the selected root directory).
            - The *_arc folders are then rebuilt into .arc files, replacing the originals.
-           - This process attempts to use the (version, platform, byte order, 
+           - This process attempts to use the (version, platform, byte order,
            file order, compression hints) from the original ARC for the rebuild.
            - Processed *_arc folders are also moved to the backup directory.
 
@@ -3072,7 +3046,7 @@ class ArcToolApp:
            - Select a single output directory.
            - All files from all found ARCs (recursive) or the single dropped ARC are extracted directly into this single output directory.
            - The original folder structure *within* the ARCs is discarded (flattened).
-           - To prevent name collisions, extracted filenames are prefixed with the name of their source ARC 
+           - To prevent name collisions, extracted filenames are prefixed with the name of their source ARC
            (e.g., 'arc1_image.tex', 'arc2_sound.wav').
 
         6. Internal-ARC Extraction:
@@ -3082,9 +3056,9 @@ class ArcToolApp:
            - Select an output directory.
            - Click "Extract Selected Items".
              - If a file is checked, it's saved to: `output_dir/filename.ext`
-             - If a folder (e.g., 'textures/player') is checked, its contents are saved to: 
+             - If a folder (e.g., 'textures/player') is checked, its contents are saved to:
              `output_dir/player/content_file.ext`.
-        
+
         7. Internal-ARC Injection:
            - Select a single .arc file to load (or drag & drop) and preview its internal file/folder structure.
            - Select a file in the tree and click "Replace Selected File..." to choose a new file from your disk.
@@ -3095,9 +3069,9 @@ class ArcToolApp:
              - Files marked for replacement will use the new data.
              - All other files will be copied from the original ARC.
              - The original file order, format (version, platform, byte order) will be retained.
-        
+
         Note: This tool does not process encrypted .arcc files. Any .arcc files encountered will be skipped.
-        """ 
+        """
         help_win = tk.Toplevel(self.root)
         help_win.title("Help - SaladSoftware ARC Tool")
         help_win.configure(bg=BG_COLOR)
@@ -3111,7 +3085,7 @@ class ArcToolApp:
         content_frame.grid_rowconfigure(0, weight=1)
         content_frame.grid_columnconfigure(0, weight=1)
 
-        help_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE-1) 
+        help_font = tkFont.Font(family=FONT_FAMILY, size=FONT_SIZE-1)
         help_text_widget = scrolledtext.ScrolledText(
             content_frame,
             wrap=tk.WORD,
@@ -3142,57 +3116,398 @@ class ArcToolApp:
         help_win.focus_set()
         ok_button.focus_set()
 
+# --- CLI Support ---
+def cli_status_callback(message, level=STATUS_INFO):
+    timestamp = datetime.now().strftime("[%H:%M:%S]")
+    print(f"{timestamp} [{level.upper()}] {message}", file=sys.stderr if level in [STATUS_ERROR, STATUS_WARN] else sys.stdout)
+
+def cli_progress_callback(value):
+    sys.stdout.write(f"\rProgress: {int(value):3}%")
+    sys.stdout.flush()
+    if value >= 100:
+        sys.stdout.write("\n") # Newline after completion
+        sys.stdout.flush()
+
+class CliStatusQueueAdapter:
+    """ Adapts the status_queue.put interface to a direct callback for MTArc.load """
+    def __init__(self, callback):
+        self.callback = callback
+    def put(self, item):
+        if item and isinstance(item, dict) and item.get('type') == 'status':
+            self.callback(item.get('msg',''), item.get('level', STATUS_INFO))
+        # Progress items from MTArc.load are ignored by this adapter, CLI progress is handled by run_batch_parallel
+
+def handle_cli_extract(args):
+    cli_status_callback(f"Starting List Extraction for: {', '.join(args.arc_files)}", STATUS_INFO)
+    run_batch_parallel(_list_extract_worker, args.arc_files, None,
+                       cli_progress_callback, cli_status_callback, args.key1, args.key2)
+
+def handle_cli_inject(args):
+    cli_status_callback(f"Starting List Injection for folders: {', '.join(args.folders)}", STATUS_INFO)
+    if not args.output_dir:
+        cli_status_callback("Error: --output-dir is required for inject command.", STATUS_ERROR)
+        return
+
+    all_params, all_orders, all_meta_maps, all_is_arcc = [], [], [], [] # target_is_arcc is always False
+
+    default_params = {
+        "version": DEFAULT_VERSION, "platform": DEFAULT_PLATFORM, "bo_char": DEFAULT_BYTE_ORDER_CHAR,
+        "entry_has_extended_names": False
+    }
+
+    for folder_path_str in args.folders:
+        folder_p = pathlib.Path(folder_path_str)
+        params_for_item = default_params.copy()
+        file_order_for_item = None
+        meta_map_for_item = {}
+
+        if folder_p.name.endswith("_arc"):
+            arc_basename = folder_p.name[:-4]
+            potential_orig_arc = folder_p.parent / (arc_basename + ".arc")
+            if potential_orig_arc.is_file():
+                cli_status_callback(f"Found potential original ARC '{potential_orig_arc.name}' for '{folder_p.name}'. Loading parameters...", STATUS_DEBUG)
+                temp_arc = MTArc()
+                try:
+                    # Use adapter for MTArc.load's status_queue
+                    temp_arc.load(str(potential_orig_arc), key1=args.key1, key2=args.key2, status_queue_or_callback=CliStatusQueueAdapter(cli_status_callback))
+                    if temp_arc.arc_header:
+                        params_for_item = {
+                            "version": temp_arc.version, "platform": temp_arc.platform,
+                            "bo_char": temp_arc.byte_order_char, "entry_has_extended_names": temp_arc.entry_has_extended_names
+                        }
+                        file_order_for_item = [fi['full_filename'] for fi in temp_arc.files]
+                        for fi_orig in temp_arc.files:
+                            norm_key = fi_orig['full_filename'].lower().replace('\\','/')
+                            meta_map_for_item[norm_key] = {
+                                'is_compressed': fi_orig['is_compressed'],
+                                'uncompressed_size_raw': fi_orig['uncompressed_size_raw']
+                            }
+                        cli_status_callback(f"Using parameters from '{potential_orig_arc.name}'.", STATUS_INFO)
+                    else:
+                         cli_status_callback(f"Failed to load header from '{potential_orig_arc.name}', using defaults for '{folder_p.name}'.", STATUS_WARN)
+                except ARCCSkippedError:
+                    cli_status_callback(f"Original ARC '{potential_orig_arc.name}' is ARCC, using defaults for '{folder_p.name}'.", STATUS_INFO)
+                except Exception as e:
+                    cli_status_callback(f"Error loading original ARC '{potential_orig_arc.name}': {e}. Using defaults.", STATUS_WARN)
+                finally:
+                    if temp_arc: temp_arc.close()
+            else:
+                 cli_status_callback(f"No original ARC found for '{folder_p.name}', using defaults.", STATUS_DEBUG)
+        else:
+            cli_status_callback(f"Folder '{folder_p.name}' doesn't end with '_arc', using defaults.", STATUS_DEBUG)
+
+        all_params.append(params_for_item)
+        all_orders.append(file_order_for_item)
+        all_meta_maps.append(meta_map_for_item)
+        all_is_arcc.append(False) # ARCC rebuild not supported
+
+    run_batch_parallel(_list_inject_worker, args.folders, args.output_dir,
+                       cli_progress_callback, cli_status_callback, args.key1, args.key2,
+                       original_arc_params_list=all_params,
+                       target_is_arcc_list=all_is_arcc,
+                       original_file_orders_list=all_orders,
+                       original_file_metadata_map_list=all_meta_maps)
+
+def handle_cli_extract_recursive(args):
+    cli_status_callback(f"Starting Recursive Extraction from: {args.source_dir}", STATUS_INFO)
+    recursive_batch_extract(args.source_dir, None, cli_progress_callback, cli_status_callback, args.key1, args.key2)
+
+def handle_cli_inject_recursive(args):
+    cli_status_callback(f"Starting Recursive In-Place Injection in: {args.source_dir}", STATUS_INFO)
+    folder_batch_inject(args.source_dir, cli_progress_callback, cli_status_callback, args.key1, args.key2)
+
+def handle_cli_extract_flat(args):
+    cli_status_callback(f"Starting Flattened Extraction from '{args.source_path}' to '{args.output_dir}'", STATUS_INFO)
+    source_p = pathlib.Path(args.source_path)
+    if not args.output_dir:
+        cli_status_callback("Error: --output-dir is required for extract-flat command.", STATUS_ERROR)
+        return
+
+    if source_p.is_file() and source_p.suffix.lower() == '.arc':
+        run_batch_parallel(_flatten_extract_worker, [str(source_p)], args.output_dir,
+                           cli_progress_callback, cli_status_callback, args.key1, args.key2)
+    elif source_p.is_dir():
+        recursive_flatten_extract(str(source_p), args.output_dir,
+                                  cli_progress_callback, cli_status_callback, args.key1, args.key2)
+    else:
+        cli_status_callback(f"Error: Source path '{args.source_path}' is not a valid ARC file or directory.", STATUS_ERROR)
+
+def handle_cli_extract_internal(args):
+    cli_status_callback(f"Starting Internal ARC Extraction from '{args.arc_file}' to '{args.output_dir}'", STATUS_INFO)
+    if not args.output_dir:
+        cli_status_callback("Error: --output-dir is required.", STATUS_ERROR)
+        return
+    if not args.items:
+        cli_status_callback("Error: --items must specify at least one internal path to extract.", STATUS_ERROR)
+        return
+
+    arc = MTArc()
+    items_to_extract_data = []
+    try:
+        arc.load(args.arc_file, key1=args.key1, key2=args.key2, status_queue_or_callback=CliStatusQueueAdapter(cli_status_callback))
+        if not arc.files:
+            cli_status_callback(f"ARC '{args.arc_file}' is empty or failed to load.", STATUS_WARN)
+            return
+
+        output_dir_p = pathlib.Path(args.output_dir)
+        output_dir_p.mkdir(parents=True, exist_ok=True)
+
+        arc_files_map = {fi['full_filename'].replace('\\', '/'): fi for fi in arc.files}
+
+        for internal_path_raw in args.items:
+            internal_path = internal_path_raw.replace('\\', '/')
+            if internal_path in arc_files_map:
+                file_info = arc_files_map[internal_path]
+                target_disk_path = output_dir_p / internal_path # Preserve full structure
+                items_to_extract_data.append((file_info, target_disk_path))
+            else:
+                cli_status_callback(f"Warning: Internal item '{internal_path}' not found in ARC '{args.arc_file}'.", STATUS_WARN)
+
+        if not items_to_extract_data:
+            cli_status_callback("No valid items found to extract from the ARC.", STATUS_INFO)
+            return
+
+        # Create a dummy app or adapt _perform_internal_arc_extraction_thread if it relies on app state
+        # For now, let's call a simplified version or adapt the existing one.
+        # The GUI version of _perform_internal_arc_extraction_thread uses self.current_arc_for_internal_view
+        # We can pass the loaded `arc` object.
+        # We'll call it directly in the main thread for CLI simplicity here, or adapt for threading if preferred.
+        # Adapting _perform_internal_arc_extraction_thread to be callable without 'self'
+        
+        # Simplified direct extraction loop for CLI:
+        total_items = len(items_to_extract_data)
+        processed_count = 0
+        error_count = 0
+        for i, (file_info, target_disk_path) in enumerate(items_to_extract_data):
+            try:
+                cli_status_callback(f"Extracting '{file_info['full_filename']}' to '{target_disk_path}'...", STATUS_DEBUG)
+                file_data = arc.extract_file(file_info, args.arc_file)
+                target_disk_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(target_disk_path, 'wb') as out_f:
+                    out_f.write(file_data)
+                processed_count += 1
+            except Exception as e:
+                error_count += 1
+                cli_status_callback(f"Error extracting '{file_info['full_filename']}' to '{target_disk_path}': {e}", STATUS_ERROR)
+            cli_progress_callback((i + 1) / total_items * 100)
+        
+        final_msg = f"Internal ARC extraction complete. Extracted: {processed_count}, Errors: {error_count}."
+        final_level = STATUS_SUCCESS if error_count == 0 and processed_count > 0 else (STATUS_WARN if processed_count > 0 else STATUS_ERROR)
+        cli_status_callback(final_msg, final_level)
+
+    except ARCCSkippedError:
+        pass # message already handled by MTArc.load
+    except Exception as e:
+        cli_status_callback(f"Error during internal ARC extraction: {e}", STATUS_ERROR)
+        traceback.print_exc(file=sys.stderr)
+    finally:
+        if arc: arc.close()
+
+def handle_cli_inject_internal(args):
+    cli_status_callback(f"Starting Internal ARC Injection from '{args.arc_file}' to '{args.output_arc}'", STATUS_INFO)
+    if not args.output_arc:
+        cli_status_callback("Error: --output-arc is required.", STATUS_ERROR)
+        return
+
+    files_to_inject_map_cli = {}
+    if args.replace:
+        for rep_arg in args.replace:
+            parts = rep_arg.split('=', 1)
+            if len(parts) == 2:
+                internal_path = parts[0].strip().replace('\\', '/')
+                disk_file_path = parts[1].strip()
+                if not os.path.isfile(disk_file_path):
+                    cli_status_callback(f"Error: Replacement disk file not found: '{disk_file_path}' for internal '{internal_path}'", STATUS_ERROR)
+                    return
+                files_to_inject_map_cli[internal_path.lower()] = disk_file_path
+            else:
+                cli_status_callback(f"Error: Invalid format for --replace argument: '{rep_arg}'. Expected 'internal/path=disk/path'.", STATUS_ERROR)
+                return
+
+    if not files_to_inject_map_cli and not args.force_repack:
+        cli_status_callback("No files specified for replacement via --replace. Use --force-repack to repack without changes.", STATUS_INFO)
+        return
+
+    # Simplified direct injection for CLI:
+    arc_loader = MTArc()
+    arc_saver = MTArc()
+    try:
+        cli_status_callback(f"Loading original ARC '{args.arc_file}'...", STATUS_DEBUG)
+        arc_loader.load(args.arc_file, key1=args.key1, key2=args.key2, status_queue_or_callback=CliStatusQueueAdapter(cli_status_callback))
+        if not arc_loader.files:
+            cli_status_callback(f"Original ARC '{args.arc_file}' is empty or failed to load.", STATUS_ERROR)
+            return
+
+        files_to_pack = []
+        total_arc_files = len(arc_loader.files)
+        cli_status_callback(f"Preparing {total_arc_files} files for repack...", STATUS_INFO)
+
+        for i, original_fi in enumerate(arc_loader.files):
+            new_fi = original_fi.copy()
+            internal_path_norm = original_fi['full_filename'].lower().replace('\\', '/')
+            
+            if internal_path_norm in files_to_inject_map_cli:
+                disk_path = files_to_inject_map_cli[internal_path_norm]
+                cli_status_callback(f"Replacing '{original_fi['full_filename']}' with data from '{disk_path}'...", STATUS_DEBUG)
+                try:
+                    new_data = pathlib.Path(disk_path).read_bytes()
+                    new_fi['data'] = new_data
+                except Exception as e:
+                    cli_status_callback(f"Error reading replacement file '{disk_path}': {e}. Using original data.", STATUS_WARN)
+                    new_fi['data'] = arc_loader.extract_file(original_fi, args.arc_file) # Fallback
+            else:
+                new_fi['data'] = arc_loader.extract_file(original_fi, args.arc_file)
+            
+            new_fi['original_is_compressed_hint'] = original_fi['is_compressed']
+            new_fi['original_uncompressed_size_raw_hint'] = original_fi['uncompressed_size_raw']
+            files_to_pack.append(new_fi)
+            cli_progress_callback((i + 1) / total_arc_files * 100)
+        
+        cli_status_callback(f"Saving rebuilt ARC to '{args.output_arc}'...", STATUS_INFO)
+        arc_saver.save(
+            args.output_arc, files_to_pack,
+            key1=args.key1, key2=args.key2,
+            target_version=arc_loader.version,
+            target_platform=arc_loader.platform,
+            target_byte_order_char=arc_loader.byte_order_char,
+            target_is_arcc=False, # ARCC not supported for rebuild
+            target_entry_has_extended_names=arc_loader.entry_has_extended_names
+        )
+        cli_status_callback(f"Successfully rebuilt ARC to '{args.output_arc}'.", STATUS_SUCCESS)
+
+    except ARCCSkippedError:
+        pass
+    except Exception as e:
+        cli_status_callback(f"Error during internal ARC injection: {e}", STATUS_ERROR)
+        traceback.print_exc(file=sys.stderr)
+    finally:
+        if arc_loader: arc_loader.close()
+        if arc_saver: arc_saver.close()
+
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
-    if TkinterDnD:
-        root = TkinterDnD.Tk()
-    else:
-        try:
-            root = tk.Tk()
-            messagebox.showwarning("Dependency Missing",
-                                 "Required 'tkinterdnd2' library not found for drag & drop.\n"
-                                 "Please install it (e.g., pip install tkinterdnd2).\n"
-                                 "The application will run without drag & drop support.")
-        except tk.TclError:
-             print("ERROR: tkinterdnd2 library not found AND Tkinter is not available for dialog.\n"
-                   "Please install it (e.g., pip install tkinterdnd2).\n"
-                   "Drag & drop will be disabled.", file=sys.stderr)
-             sys.exit(1) 
+    parser = argparse.ArgumentParser(description=f"Handburger's SaladSoftware MT Arc Tool - Version {VERSION}", formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
+    subparsers = parser.add_subparsers(dest="command", title="Commands",
+                                       help="Run a command with -h for more details (e.g., %(prog)s extract -h)")
 
+    key_args = [
+        (['-k1', '--key1'], {'type': str, 'default': None, 'help': 'Blowfish Key Part 1 (currently unused).'}),
+        (['-k2', '--key2'], {'type': str, 'default': None, 'help': 'Blowfish Key Part 2 (currently unused).'})
+    ]
+
+    # Extract command
+    p_extract = subparsers.add_parser('extract', help='Extract one or more ARC files. Output is <filename>_arc next to each input.')
+    p_extract.add_argument('arc_files', metavar='ARC_FILE', type=str, nargs='+', help='Path(s) to ARC file(s) to extract.')
+    for pargs, pkwargs in key_args: p_extract.add_argument(*pargs, **pkwargs)
+    p_extract.set_defaults(func=handle_cli_extract)
+
+    # Inject command
+    p_inject = subparsers.add_parser('inject', help='Rebuild ARC files from source folders.')
+    p_inject.add_argument('folders', metavar='FOLDER', type=str, nargs='+', help='Path(s) to source folder(s) to rebuild into ARCs.')
+    p_inject.add_argument('--output-dir', '-o', type=str, required=True, help='Directory to save rebuilt ARC files.')
+    for pargs, pkwargs in key_args: p_inject.add_argument(*pargs, **pkwargs)
+    p_inject.set_defaults(func=handle_cli_inject)
+
+    # Extract-recursive command
+    p_extract_rec = subparsers.add_parser('extract-recursive', help='Recursively find and extract ARC files in a directory.')
+    p_extract_rec.add_argument('source_dir', metavar='SOURCE_DIR', type=str, help='Root directory to scan for ARC files.')
+    for pargs, pkwargs in key_args: p_extract_rec.add_argument(*pargs, **pkwargs)
+    p_extract_rec.set_defaults(func=handle_cli_extract_recursive)
+
+    # Inject-recursive command
+    p_inject_rec = subparsers.add_parser('inject-recursive', help='Recursively find and rebuild ARC files in-place from matching *_arc folders.')
+    p_inject_rec.add_argument('source_dir', metavar='SOURCE_DIR', type=str, help='Root directory with ARCs and *_arc folders.')
+    for pargs, pkwargs in key_args: p_inject_rec.add_argument(*pargs, **pkwargs)
+    p_inject_rec.set_defaults(func=handle_cli_inject_recursive)
+
+    # Extract-flat command
+    p_extract_flat = subparsers.add_parser('extract-flat', help='Extract all files from ARC(s) into a single flat output directory.')
+    p_extract_flat.add_argument('source_path', metavar='SOURCE_PATH', type=str, help='Path to a single ARC file or a root directory to scan recursively.')
+    p_extract_flat.add_argument('--output-dir', '-o', type=str, required=True, help='Directory to save all extracted files (flattened).')
+    for pargs, pkwargs in key_args: p_extract_flat.add_argument(*pargs, **pkwargs)
+    p_extract_flat.set_defaults(func=handle_cli_extract_flat)
+
+    # Extract-internal command
+    p_extract_int = subparsers.add_parser('extract-internal', help='Extract specific items from an ARC, preserving structure.')
+    p_extract_int.add_argument('arc_file', metavar='ARC_FILE', type=str, help='Path to the source ARC file.')
+    p_extract_int.add_argument('--items', metavar='INTERNAL_PATH', type=str, nargs='+', required=True, help='Full internal path(s) of items to extract (e.g., "path/to/file.tex").')
+    p_extract_int.add_argument('--output-dir', '-o', type=str, required=True, help='Directory to save extracted items.')
+    for pargs, pkwargs in key_args: p_extract_int.add_argument(*pargs, **pkwargs)
+    p_extract_int.set_defaults(func=handle_cli_extract_internal)
+
+    # Inject-internal command
+    p_inject_int = subparsers.add_parser('inject-internal', help='Rebuild an ARC, replacing specific internal files with disk files.')
+    p_inject_int.add_argument('arc_file', metavar='ARC_FILE', type=str, help='Path to the source ARC file.')
+    p_inject_int.add_argument('--replace', metavar='INTERNAL=DISK', action='append', help='Specify a replacement: "internal/path=path/to/diskfile". Can be used multiple times.')
+    p_inject_int.add_argument('--output-arc', '-o', type=str, required=True, help='Path to save the newly rebuilt ARC file.')
+    p_inject_int.add_argument('--force-repack', action='store_true', help='Force repacking even if no files are replaced (useful for testing or format conversion if other params change).')
+    for pargs, pkwargs in key_args: p_inject_int.add_argument(*pargs, **pkwargs)
+    p_inject_int.set_defaults(func=handle_cli_inject_internal)
+
+    args = parser.parse_args()
+
+    # --- Common Setup (Crypto check, Extension map loading) ---
     try:
-        _ = Blowfish.new(b"12345678", Blowfish.MODE_ECB)
+        _ = Blowfish.new(b"12345678", Blowfish.MODE_ECB) # Basic check
     except ImportError:
-        try:
-            temp_root_crypto = tk.Tk(); temp_root_crypto.withdraw()
-            messagebox.showerror("Dependency Missing","Required 'pycryptodome' library not found.\nPlease install it via: pip install pycryptodome")
-            temp_root_crypto.destroy()
-        except tk.TclError:
-            print("ERROR: pycryptodome library not found AND Tkinter is not available for dialog.\nPlease install it via: pip install pycryptodome", file=sys.stderr)
-        sys.exit(1) 
+        msg = "Required 'pycryptodome' library not found. Please install it (e.g., pip install pycryptodome)."
+        if not args.command: # GUI mode
+            try:
+                temp_root_crypto = tk.Tk(); temp_root_crypto.withdraw()
+                messagebox.showerror("Dependency Missing", msg)
+                temp_root_crypto.destroy()
+            except tk.TclError: print(f"ERROR: {msg}", file=sys.stderr)
+        else: # CLI mode
+            print(f"ERROR: {msg}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e_crypto_test:
-        try:
-            temp_root_crypto = tk.Tk(); temp_root_crypto.withdraw()
-            messagebox.showerror("Dependency Error",f"Error initializing 'pycryptodome': {e_crypto_test}\nIt might be installed incorrectly or conflict with other crypto libraries.")
-            temp_root_crypto.destroy()
-        except tk.TclError:
-            print(f"ERROR: Error initializing 'pycryptodome': {e_crypto_test}", file=sys.stderr)
-        sys.exit(1) 
+        msg = f"Error initializing 'pycryptodome': {e_crypto_test}. It might be installed incorrectly."
+        if not args.command: # GUI mode
+            try:
+                temp_root_crypto = tk.Tk(); temp_root_crypto.withdraw()
+                messagebox.showerror("Dependency Error", msg)
+                temp_root_crypto.destroy()
+            except tk.TclError: print(f"ERROR: {msg}", file=sys.stderr)
+        else: # CLI mode
+            print(f"ERROR: {msg}", file=sys.stderr)
+        sys.exit(1)
 
-    primary_extension_map_path = resource_path(EXTENSION_MAP_FILE)
-    game_specific_map_path = resource_path(GAME_SPECIFIC_HASH_FILE)
+    primary_ext_map_path = resource_path(EXTENSION_MAP_FILE)
+    game_specific_ext_map_path = resource_path(GAME_SPECIFIC_HASH_FILE)
 
-    if not os.path.exists(primary_extension_map_path):
-        warning_msg = (f"Primary extension map file '{EXTENSION_MAP_FILE}' not found where expected.\n"
-                       "It should be bundled with the application or in the same directory as the script if run directly.\n"
-                       "Extracted files might have generic hexadecimal extensions (e.g., .1234ABCD) instead of meaningful ones (e.g., .tex).")
-        try:
-            temp_root_warn = tk.Tk(); temp_root_warn.withdraw();
-            messagebox.showwarning("Extension Map Missing", warning_msg)
-            temp_root_warn.destroy()
-        except tk.TclError:
-            print(f"WARNING: {warning_msg}", file=sys.stderr)
+    if not os.path.exists(primary_ext_map_path):
+        warning_msg_ext = (f"Primary extension map file '{EXTENSION_MAP_FILE}' not found.\n"
+                           "Extracted files might have generic hexadecimal extensions.")
+        if not args.command: # GUI mode
+             try:
+                temp_root_warn = tk.Tk(); temp_root_warn.withdraw();
+                messagebox.showwarning("Extension Map Missing", warning_msg_ext)
+                temp_root_warn.destroy()
+             except tk.TclError: print(f"WARNING: {warning_msg_ext}", file=sys.stderr) # Fallback if Tk fails early
+        else: # CLI mode
+            print(f"WARNING: {warning_msg_ext}", file=sys.stderr)
 
-    load_extension_map(primary_extension_map_path, game_specific_map_path)
+    load_extension_map(primary_ext_map_path, game_specific_ext_map_path)
+    # --- End Common Setup ---
 
-    app = ArcToolApp(root)
-    root.mainloop()
+    if hasattr(args, 'func'):
+        args.func(args) # Execute CLI command handler
+    else: # No command given, or invalid command, default to GUI
+        if TkinterDnD:
+            root = TkinterDnD.Tk()
+        else:
+            try:
+                root = tk.Tk()
+                messagebox.showwarning("Dependency Missing",
+                                     "Required 'tkinterdnd2' library not found for drag & drop.\n"
+                                     "Please install it (e.g., pip install tkinterdnd2).\n"
+                                     "The application will run without drag & drop support.")
+            except tk.TclError:
+                 print("ERROR: tkinterdnd2 library not found AND Tkinter is not available for dialog.\n"
+                       "Please install it (e.g., pip install tkinterdnd2).\n"
+                       "Drag & drop will be disabled.", file=sys.stderr)
+                 sys.exit(1) # Critical for GUI if Tk itself fails
+
+        app = ArcToolApp(root)
+        root.mainloop()
