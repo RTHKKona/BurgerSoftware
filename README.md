@@ -58,6 +58,6 @@ SaladSoftware uses Kuriimu (1) Karameru C# code, but uses python instead. Origin
 
 ## Compiling
 
-I used ``` pyinstaller --name "SaladSoftware" --onefile --windowed --icon="salad_icon.ico" --add-data "extension_index_line.txt:." --add-data "unique_extensions.txt:." --hidden-import "Crypto.Cipher.Blowfish" SaladSoftware.py ``` to compile this project into an exe.
+I used ``` pyinstaller --onefile --windowed --icon salad_icon.ico --name "SaladSoftware 1.5" --add-data "extension_index_line.txt;." --add-data "unique_extensions.txt;." SaladSoftware.py ``` to compile this project into an exe.
 
 ###### buh
