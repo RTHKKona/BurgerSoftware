@@ -1,12 +1,3 @@
-# Handburger's MT Framework ARC Decryptor/Extractor
-# This script is a Python port of the original C# code from IcySon55's Kuriimu and FanTranslatorsInternational's Kuriimu2.
-# Kuriimu2 has a GPL-3.0 license, and this script is intended for strictly personal use.
-# It is designed to process and extract files from MT Framework ARC archives.
-# The script includes various utility functions, a GUI for user interaction, and support for Blowfish encryption/decryption.
-VERSION = "2.0" # Final unabridged version with all functions restored
-# Updated 2025-06-12
-
-
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import tkinter.font as tkFont
@@ -72,10 +63,16 @@ EXTENSION_MAP_FILE = "unique_extensions.txt"
 GAME_SPECIFIC_HASH_FILE = "extension_index_line.txt"
 
 ##### Debug here yo #####
-DEBUG_PER_FILE = True
-DEBUG_VERIFY_HASH = True
+DEBUG_PER_FILE = False #True or False
+DEBUG_VERIFY_HASH = False # True or False
 
-
+# Handburger's MT Framework ARC Decryptor/Extractor
+# This script is a Python port of the original C# code from IcySon55's Kuriimu and FanTranslatorsInternational's Kuriimu2.
+# Kuriimu2 has a GPL-3.0 license, and this script is intended for strictly personal use.
+# It is designed to process and extract files from MT Framework ARC archives.
+# The script includes various utility functions, a GUI for user interaction, and support for Blowfish encryption/decryption.
+VERSION = "2.2" # Final unabridged version with all functions restored
+# Updated 2025-06-14
 
 
 def resource_path(relative_path):
@@ -83,14 +80,14 @@ def resource_path(relative_path):
     except Exception: base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
-def get_md5_hash(filepath):
+def get_sha256_hash(filepath):
     """Calculates the MD5 hash of a file, reading it in chunks."""
-    hash_md5 = hashlib.md5()
+    hash_sha256 = hashlib.sha256()
     try:
         with open(filepath, "rb") as f:
             for chunk in iter(lambda: f.read(65536), b""):
-                hash_md5.update(chunk)
-        return hash_md5.hexdigest()
+                hash_sha256.update(chunk)
+        return hash_sha256.hexdigest()
     except FileNotFoundError:
         return "ERROR: File not found"
     except Exception as e:
@@ -484,6 +481,7 @@ def _in_place_rebuild_worker(source_folder_str, _ignored_output_dir, key1, key2,
     """
     Performs a high-fidelity 'in-place' repack, now with a final MD5 hash verification step.
     """
+    move_originals_on_success = kwargs.get('move_originals', False)
     source_folder_path = pathlib.Path(source_folder_str)
     
     # Define paths early for robust error handling
@@ -496,10 +494,10 @@ def _in_place_rebuild_worker(source_folder_str, _ignored_output_dir, key1, key2,
         if not original_arc_path.is_file():
             raise FileNotFoundError(f"Cannot perform in-place rebuild: Original file '{original_arc_path}' not found next to the folder.")
         
-        if backup_arc_path.exists():
-            status_callback_worker(f"ERROR: A backup file '{backup_arc_path.name}' already exists. Please remove or rename it before proceeding.", STATUS_ERROR)
-            return source_folder_path.name, False
-
+        if backup_arc_path.exists() and not move_originals_on_success:
+             status_callback_worker(f"ERROR: A backup file '{backup_arc_path.name}' already exists. Please remove or rename it, or enable the 'move originals' option.", STATUS_ERROR)
+             return source_folder_path.name, False
+        
         status_callback_worker(f"Starting high-fidelity rebuild for '{original_arc_path.name}'...", STATUS_INFO)
         original_arc = MTArc()
         original_arc.load(str(original_arc_path), status_queue_or_callback=status_callback_worker)
@@ -538,17 +536,36 @@ def _in_place_rebuild_worker(source_folder_str, _ignored_output_dir, key1, key2,
 
         status_callback_worker(f"Successfully rebuilt '{original_arc_path.name}'. Original is now '{backup_arc_path.name}'.", STATUS_SUCCESS)
         
+        # --- NEW MOVE LOGIC ---
+        if move_originals_on_success:
+            try:
+                original_data_dir = original_arc_path.parent / "original_data"
+                original_data_dir.mkdir(exist_ok=True)
+                
+                # Move the backup .arc file
+                target_backup_path = original_data_dir / backup_arc_path.name
+                shutil.move(str(backup_arc_path), str(target_backup_path))
+                
+                # Move the source _arc folder
+                target_folder_path = original_data_dir / source_folder_path.name
+                shutil.move(str(source_folder_path), str(target_folder_path))
+                
+                status_callback_worker(f"Moved backup '{backup_arc_path.name}' and source folder '{source_folder_path.name}' to '{original_data_dir}'.", STATUS_INFO)
+            except Exception as move_e:
+                status_callback_worker(f"Rebuild was successful, but failed to move original files: {move_e}", STATUS_ERROR)
+
         # --- HASH VERIFICATION STEP ---
         if DEBUG_VERIFY_HASH:
             status_callback_worker("--- STARTING HASH VERIFICATION ---", STATUS_DEBUG)
-            original_hash = get_md5_hash(str(backup_arc_path))
-            new_hash = get_md5_hash(str(original_arc_path))
-            status_callback_worker(f"  Original MD5: {original_hash}", STATUS_DEBUG)
-            status_callback_worker(f"  New File MD5: {new_hash}", STATUS_DEBUG)
+            original_hash_path = target_backup_path if move_originals_on_success else backup_arc_path
+            original_hash = get_sha256_hash(str(original_hash_path))
+            new_hash = get_sha256_hash(str(original_arc_path))
+            status_callback_worker(f"  Original SHA256: {original_hash}", STATUS_DEBUG)
+            status_callback_worker(f"  New File SHA256: {new_hash}", STATUS_DEBUG)
             if original_hash == new_hash and "ERROR" not in original_hash:
                 status_callback_worker("HASH MATCH: Repacked file is byte-for-byte identical to the original.", STATUS_SUCCESS)
             else:
-                status_callback_worker("HASH MISMATCH: Repacked file is NOT identical. A bug still exists.", STATUS_ERROR)
+                status_callback_worker("HASH MISMATCH: Repacked file is NOT identical. A bug or intentional change exists.", STATUS_ERROR)
             status_callback_worker("--- HASH VERIFICATION COMPLETE ---", STATUS_DEBUG)
         
         return source_folder_path.name, True
@@ -615,7 +632,8 @@ def recursive_flatten_extract(source_root_dir, common_output_dir, progress_callb
     run_batch_parallel(_flatten_extract_worker, arc_files, common_output_dir, progress_callback, status_callback, key1, key2)
 
 def run_batch_parallel(worker_func, item_list, output_dir, progress_callback, status_callback, key1, key2, **kwargs):
-    if not item_list: return
+    if not item_list: return []
+    results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = []
         for i, item in enumerate(item_list):
@@ -631,11 +649,16 @@ def run_batch_parallel(worker_func, item_list, output_dir, progress_callback, st
 
         completed = 0
         for future in concurrent.futures.as_completed(futures):
-            try: future.result()
-            except Exception as e: status_callback(f"Worker thread error: {e}", STATUS_ERROR)
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                status_callback(f"Worker thread error: {e}", STATUS_ERROR)
+                results.append((None, False)) # Indicate failure
             completed += 1
             progress_callback(completed / len(futures) * 100)
     status_callback("Batch operation complete.", STATUS_SUCCESS)
+    return results
 
 # --- GUI AND CLI CODE ---
 class ArcToolApp:
@@ -657,15 +680,21 @@ class ArcToolApp:
         header_frame.pack(pady=5, padx=10, fill='x')
         ttk.Label(header_frame, text=f"~ Handburger's SaladSoftware MT Arc Tool ~ Version {VERSION}", style='TLabel', font=self.title_font).pack(side=tk.LEFT, anchor='w')
         self.help_button = ttk.Button(header_frame, text="Help", command=self.show_help, style='TButton'); self.help_button.pack(side=tk.RIGHT, padx=5, pady=5)
+        self.debug_verify_hash_button = ttk.Button(header_frame, text="...", command=self.toggle_debug_verify_hash, style='TButton')
+        self.debug_verify_hash_button.pack(side=tk.RIGHT, padx=(0, 5))
+        self.debug_per_file_button = ttk.Button(header_frame, text="...", command=self.toggle_debug_per_file, style='TButton')
+        self.debug_per_file_button.pack(side=tk.RIGHT, padx=(0, 5))
+        self.update_debug_buttons_text()
 
         attribution_text = "Uses Kuriimu1 and Kuriimu2 MT Arc Logic (GPL-3.0 License - legal permission to copy, distribute, and modify)"
         ttk.Label(self.top_pane_frame, text=attribution_text, style='TLabel', font=self.tab_label_font).pack(anchor='w', pady=(0, 10), padx=10)
 
         self.notebook = ttk.Notebook(self.top_pane_frame, style='TNotebook')
         self.list_extract_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
+        self.folder_inject_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
         self.list_inject_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
         self.rec_extract_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
-        self.folder_inject_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
+        self.rec_inject_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
         self.flatten_extract_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
         self.internal_arc_extract_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
         self.internal_arc_inject_frame = ttk.Frame(self.notebook, style='TFrame', padding=10)
@@ -674,6 +703,7 @@ class ArcToolApp:
         self.notebook.add(self.folder_inject_frame, text='2. Repack Folder (In-Place)')
         self.notebook.add(self.list_inject_frame, text='3. Build New ARC from Folder')
         self.notebook.add(self.rec_extract_frame, text='Batch: Extract All in Folder')
+        self.notebook.add(self.rec_inject_frame, text='Batch: Repack Folders (In-Place)')
         self.notebook.add(self.flatten_extract_frame, text='Batch: Extract All (Single Folder)')
         self.notebook.add(self.internal_arc_extract_frame, text='Advanced: Partial Extract')
         self.notebook.add(self.internal_arc_inject_frame, text='Advanced: Partial Inject')
@@ -681,6 +711,7 @@ class ArcToolApp:
         self.notebook.pack(pady=5, padx=10, expand=True, fill='both')
 
         self.create_list_extract_widgets(); self.create_list_inject_widgets(); self.create_recursive_extract_widgets(); self.create_folder_inject_widgets()
+        self.create_recursive_inject_widgets()
         self.create_flatten_extract_widgets()
         self.create_internal_arc_extract_widgets()
         self.create_internal_arc_inject_widgets()
@@ -710,6 +741,7 @@ class ArcToolApp:
         s.configure('TProgressbar',thickness=20,background=STATUS_SUCCESS_FG,troughcolor=WIDGET_BG); s.configure('Vertical.TScrollbar', background=BUTTON_BG, troughcolor=WIDGET_BG); s.map('Vertical.TScrollbar', background=[('active', BUTTON_ACTIVE_BG)])
         s.configure('Treeview', background=WIDGET_BG, fieldbackground=WIDGET_BG, foreground=TEXT_COLOR); s.map('Treeview', background=[('selected', HIGHLIGHT_BG)], foreground=[('selected', HIGHLIGHT_TEXT)])
         s.configure('Treeview.Heading', background=HEADER_BG, foreground=HEADER_TEXT, font=self.bold_font, padding=5); s.map('Treeview.Heading', background=[('active', HEADER_ACTIVE_BG)])
+        s.configure('TCheckbutton', background=BG_COLOR, foreground=TEXT_COLOR, padding=5); s.map('TCheckbutton', foreground=[('active', HIGHLIGHT_TEXT)], background=[('active', BG_COLOR)], indicatorcolor=[('selected', STATUS_SUCCESS_FG), ('!selected', WIDGET_BG)], indicatorrelief=[('pressed', tk.SUNKEN), ('!pressed', tk.FLAT)])
         s.configure('file_replaced', foreground='#FFA500', font=self.bold_font)
 
     def _create_dir_input(self, parent, label, row, var_name):
@@ -780,8 +812,35 @@ class ArcToolApp:
         
         info_text = ("This tool will find all matching pairs (e.g., 'resident.arc' and 'resident_arc') in the selected directory.\nIt will rebuild each ARC using the contents of its folder, perfectly preserving all original parameters.")
         ttk.Label(frame, text=info_text, style='TLabel', justify=tk.LEFT).grid(row=2, column=0, sticky='w', padx=5, pady=(10,5))
-        self._create_dir_input(frame, "Select Directory Containing Both '.arc' and '_arc' Folders:", 3, "folder_inject_source_dir_var")
-        ttk.Button(frame, text="Start In-Place Rebuild", command=self.start_folder_injection).grid(row=5, column=0, pady=(10,10))
+        
+        self.move_to_original_data_var = tk.BooleanVar(value=True)
+        cb = ttk.Checkbutton(frame, text="On success, move original .arc backup and source _arc folder into a new 'original_data' subfolder.", variable=self.move_to_original_data_var, style='TCheckbutton')
+        cb.grid(row=3, column=0, sticky='w', padx=5, pady=(10,0))
+
+        self.delete_original_data_var = tk.BooleanVar(value=False)
+        cb_del = ttk.Checkbutton(frame, text="On success, DELETE the 'original_data' subfolder (irreversible).", variable=self.delete_original_data_var, style='TCheckbutton')
+        cb_del.grid(row=4, column=0, sticky='w', padx=5, pady=(5,0))
+        
+        self._create_dir_input(frame, "Select Directory Containing Both '.arc' and '_arc' Folders:", 5, "folder_inject_source_dir_var")
+        ttk.Button(frame, text="Start In-Place Rebuild", command=self.start_folder_injection).grid(row=7, column=0, pady=(10,10))
+
+    def create_recursive_inject_widgets(self):
+        frame = self.rec_inject_frame
+        frame.grid_columnconfigure(0, weight=1)
+        ttk.Label(frame, text="Purpose: Recursively find and rebuild all ARCs from their extracted folders.", style='Header.TLabel').grid(row=0, column=0, sticky='w', pady=(5,0))
+        info_text = ("This tool scans a directory and its subdirectories for matching pairs (e.g., 'resident.arc' and 'resident_arc').\nIt rebuilds each ARC using the high-fidelity 'in-place' method.")
+        ttk.Label(frame, text=info_text, style='TLabel', justify=tk.LEFT).grid(row=1, column=0, sticky='w', padx=5, pady=(5,5))
+
+        self.rec_inject_move_to_original_data_var = tk.BooleanVar(value=True)
+        cb_move = ttk.Checkbutton(frame, text="On success, move original .arc backups and source _arc folders into 'original_data' subfolders.", variable=self.rec_inject_move_to_original_data_var, style='TCheckbutton')
+        cb_move.grid(row=2, column=0, sticky='w', padx=5, pady=(10,0))
+        
+        self.rec_inject_delete_original_data_var = tk.BooleanVar(value=False)
+        cb_del = ttk.Checkbutton(frame, text="On success, DELETE all 'original_data' subfolders (irreversible).", variable=self.rec_inject_delete_original_data_var, style='TCheckbutton')
+        cb_del.grid(row=3, column=0, sticky='w', padx=5, pady=(5,0))
+        
+        self._create_dir_input(frame, "Select Root Directory to Scan for '.arc' and '_arc' Pairs:", 4, "rec_inject_source_dir_var")
+        ttk.Button(frame, text="Start Batch In-Place Rebuild", command=self.start_recursive_folder_injection).grid(row=5, column=0, pady=(10,10))
 
     def create_flatten_extract_widgets(self):
         frame = self.flatten_extract_frame; frame.grid_columnconfigure(0, weight=1); self._create_dir_input(frame, "Source ARC Directory (Recursive):", 0, "flatten_extract_source_var"); self._create_dir_input(frame, "Output Directory (for all flattened files):", 2, "flatten_extract_output_var")
@@ -1303,6 +1362,23 @@ class ArcToolApp:
         if current_parent_checked_state != new_parent_checked_state:
             self._set_tree_item_checked_state(parent_iid, new_parent_checked_state, recursive=False, update_parent=True)
 
+    def update_debug_buttons_text(self):
+        global DEBUG_PER_FILE, DEBUG_VERIFY_HASH
+        self.debug_per_file_button.config(text=f"Per-File Debug: {'ON' if DEBUG_PER_FILE else 'OFF'}")
+        self.debug_verify_hash_button.config(text=f"Verify Hash: {'ON' if DEBUG_VERIFY_HASH else 'OFF'}")
+
+    def toggle_debug_per_file(self):
+        global DEBUG_PER_FILE
+        DEBUG_PER_FILE = not DEBUG_PER_FILE
+        self.update_debug_buttons_text()
+        self.add_status_message(f"Per-file debug logging set to: {'ON' if DEBUG_PER_FILE else 'OFF'}", STATUS_INFO)
+
+    def toggle_debug_verify_hash(self):
+        global DEBUG_VERIFY_HASH
+        DEBUG_VERIFY_HASH = not DEBUG_VERIFY_HASH
+        self.update_debug_buttons_text()
+        self.add_status_message(f"Repack hash verification set to: {'ON' if DEBUG_VERIFY_HASH else 'OFF'}", STATUS_INFO)
+
     def _run_task(self, target_func, args_tuple=(), kwargs_dict=None):
         # This is the main task launcher for the GUI. It sets up the thread.
         final_kwargs = {}
@@ -1324,6 +1400,40 @@ class ArcToolApp:
         thread = threading.Thread(target=target_func, args=args_tuple, kwargs=final_kwargs, daemon=True)
         thread.start()
 
+    def _run_repack_and_cleanup_task(self, worker_func, item_list, output_dir,
+                                     worker_kwargs_dict, delete_originals_flag,
+                                     progress_callback, status_callback, key1, key2):
+        """
+        A wrapper task that runs a batch job and then performs cleanup if all sub-tasks succeed.
+        """
+        results = run_batch_parallel(worker_func, item_list, output_dir,
+                                     progress_callback, status_callback, key1, key2, **worker_kwargs_dict)
+
+        # After the batch job is fully complete, check results for cleanup
+        all_successful = all(res[1] for res in results) if results else False
+        
+        move_flag = worker_kwargs_dict.get('move_originals', [False]*len(item_list))[0]
+
+        if all_successful and delete_originals_flag and move_flag:
+            status_callback("All repacks successful. Deleting 'original_data' folders...", STATUS_INFO)
+            deleted_count = 0
+            for source_folder_str in item_list:
+                try:
+                    source_folder_path = pathlib.Path(source_folder_str)
+                    original_data_dir = source_folder_path.parent / "original_data"
+                    if original_data_dir.is_dir():
+                        shutil.rmtree(original_data_dir)
+                        status_callback(f"Deleted '{original_data_dir}'.", STATUS_DEBUG)
+                        deleted_count += 1
+                except Exception as e:
+                    status_callback(f"Error during cleanup of '{original_data_dir}': {e}", STATUS_ERROR)
+            status_callback(f"Cleanup complete. Deleted {deleted_count} 'original_data' folder(s).", STATUS_SUCCESS)
+        elif not all_successful and delete_originals_flag:
+            status_callback("One or more repacks failed. Skipping deletion of 'original_data' folders.", STATUS_WARN)
+        elif not move_flag and delete_originals_flag:
+            status_callback("Cleanup skipped: 'Move originals' option was not enabled, so there are no 'original_data' folders to delete.", STATUS_INFO)
+
+
     def start_list_extraction(self):
         items = self.list_extract_listbox.get(0, tk.END);
         if not items: messagebox.showwarning("Input Missing", "Please select ARC files."); return
@@ -1343,19 +1453,49 @@ class ArcToolApp:
         if not src_dir: messagebox.showwarning("Input Missing", "Please select the source directory."); return
         
         source_path = pathlib.Path(src_dir)
-        # Find folders that have a corresponding .arc file to perform a high-fidelity repack
+        # Use glob for non-recursive search in the selected directory
         task_folders = [
-            str(f) for f in source_path.rglob('*_arc') 
-            if f.is_dir() and "original_arc_backups" not in f.parts and (source_path / (f.name[:-4] + ".arc")).is_file()
+            str(f) for f in source_path.glob('*_arc') 
+            if f.is_dir() and "original_data" not in f.parts and (source_path / (f.name[:-4] + ".arc")).is_file()
         ]
 
         if not task_folders:
-            self.add_status_message("No valid folder/*.arc pairs found to process for in-place rebuild.", STATUS_WARN)
+            self.add_status_message("No valid folder/*.arc pairs found in the selected directory.", STATUS_WARN)
             return
-            
-        # FIX: Call the correct new worker function
-        self._run_task(run_batch_parallel, (_in_place_rebuild_worker, task_folders, None))
-    
+
+        move_originals_flag = self.move_to_original_data_var.get()
+        delete_originals_flag = self.delete_original_data_var.get()
+        
+        kwargs_for_worker = {'move_originals': [move_originals_flag] * len(task_folders)}
+        
+        args_for_task = (_in_place_rebuild_worker, task_folders, None, kwargs_for_worker, delete_originals_flag)
+        
+        self._run_task(self._run_repack_and_cleanup_task, args_tuple=args_for_task)
+
+    def start_recursive_folder_injection(self):
+        src_dir = self.rec_inject_source_dir_var.get()
+        if not src_dir: messagebox.showwarning("Input Missing", "Please select the source directory."); return
+        
+        source_path = pathlib.Path(src_dir)
+        # Use rglob for recursive search
+        task_folders = [
+            str(f) for f in source_path.rglob('*_arc') 
+            if f.is_dir() and "original_data" not in f.parts and (f.parent / (f.name[:-4] + ".arc")).is_file()
+        ]
+
+        if not task_folders:
+            self.add_status_message("No valid folder/*.arc pairs found recursively to process.", STATUS_WARN)
+            return
+
+        move_originals_flag = self.rec_inject_move_to_original_data_var.get()
+        delete_originals_flag = self.rec_inject_delete_original_data_var.get()
+        
+        kwargs_for_worker = {'move_originals': [move_originals_flag] * len(task_folders)}
+        
+        args_for_task = (_in_place_rebuild_worker, task_folders, None, kwargs_for_worker, delete_originals_flag)
+        
+        self._run_task(self._run_repack_and_cleanup_task, args_tuple=args_for_task)
+
     def start_recursive_extraction(self):
         src = self.rec_extract_source_var.get()
         if not src: messagebox.showwarning("Input Missing", "Please select a source directory."); return
@@ -1731,8 +1871,8 @@ class ArcToolApp:
         --------------------------
         - Purpose: To unpack an original game archive (.arc) into a folder.
         - How: Select one or more .arc files. For each file (e.g., 'resident.arc'),
-          a corresponding folder ('resident_arc') will be created next to it,
-          containing all the extracted files.
+        a corresponding folder ('resident_arc') will be created next to it,
+        containing all the extracted files.
         - This is the first step for creating a mod.
 
         Tab 2: Repack Folder (In-Place)
@@ -1740,11 +1880,13 @@ class ArcToolApp:
         - Purpose: To rebuild an edited folder back into a byte-perfect .arc file.
         - THIS IS THE RECOMMENDED METHOD FOR REPACKING MODS.
         - How: Select the main directory that contains both your original .arc file
-          (e.g., 'resident.arc') and the folder you edited (e.g., 'resident_arc').
-          The tool will automatically find these pairs.
+        (e.g., 'resident.arc') and the folder you edited (e.g., 'resident_arc').
+        The tool will automatically find these pairs.
         - It uses the original .arc to copy all parameters and unchanged files,
-          ensuring the new ARC is as close to the original as possible.
-        - Original .arc files are safely backed up in an 'original_arc_backups' folder.
+        ensuring the new ARC is as close to the original as possible.
+        - Original .arc files are safely backed up. By default, the backup and the 
+        source folder are moved into an 'original_data' subfolder to keep your
+        workspace clean.
 
         --- Other Tools ---
 
@@ -1752,30 +1894,32 @@ class ArcToolApp:
         --------------------------------
         - Purpose: To create a completely new .arc file from a folder of assets.
         - WARNING: This is for advanced users creating an ARC from scratch. It uses
-          default settings and will likely not match an existing game's format.
-          For editing existing game files, always use Tab 2.
+        default settings and will likely not match an existing game's format.
+        For editing existing game files, always use Tab 2.
 
         Batch: Extract All in Folder
         ----------------------------
         - Purpose: A convenience tool to run the 'Extract' process on every single
-          .arc file found inside a folder and all of its subfolders.
+        .arc file found inside a folder and all of its subfolders.
 
         Batch: Extract All (Single Folder)
         ----------------------------------
         - Purpose: To extract the contents of many .arc files into one single folder.
         - The internal folder structure of the ARCs is discarded ("flattened").
         - Filenames are prefixed with their source ARC name to avoid conflicts
-          (e.g., 'resident_arc_font.tex'). Useful for quickly finding a specific file.
+        (e.g., 'resident_arc_font.tex'). Useful for quickly finding a specific file.
 
         Advanced: Partial Extract / Inject
         ----------------------------------
         - These tabs allow you to view the contents of an ARC and extract or replace
-          individual files without unpacking the entire archive. This is useful for
-          small, quick edits.
+        individual files without unpacking the entire archive. This is useful for
+        small, quick edits.
 
         ------------------------------------------------
         Note: Encrypted .arcc files are not supported.
         """
+        # This line was missing. It creates a pop-up window to show the help text.
+        messagebox.showinfo("Help - SaladSoftware ARC Tool", help_text_content)
 
 # --- CLI Support ---
 def cli_status_callback(message, level=STATUS_INFO):
@@ -1821,14 +1965,15 @@ def handle_cli_inject_recursive(args):
     source_path = pathlib.Path(args.source_dir)
     task_folders = [
         str(f) for f in source_path.rglob('*_arc') 
-        if f.is_dir() and "original_arc_backups" not in f.parts and (source_path / (f.name[:-4] + ".arc")).is_file()
+        if f.is_dir() and "original_data" not in f.parts and (source_path / (f.name[:-4] + ".arc")).is_file()
     ]
     if not task_folders:
         cli_status_callback("No valid folder/*.arc pairs found to process for in-place rebuild.", STATUS_WARN)
         return
-    # FIX: Call the correct new worker function
+    
+    kwargs = {'move_originals': [args.move_originals] * len(task_folders)}
     run_batch_parallel(_in_place_rebuild_worker, task_folders, None,
-                       cli_progress_callback, cli_status_callback, args.key1, args.key2)
+                       cli_progress_callback, cli_status_callback, args.key1, args.key2, **kwargs)
 
 def handle_cli_extract_flat(args):
     cli_status_callback(f"Starting Flattened Extraction from '{args.source_path}' to '{args.output_dir}'", STATUS_INFO)
@@ -2008,7 +2153,7 @@ if __name__ == "__main__":
     p_extract = subparsers.add_parser('extract', help='Extract one or more ARC files.'); p_extract.add_argument('arc_files', metavar='ARC_FILE', type=str, nargs='+', help='Path(s) to ARC file(s).'); [p_extract.add_argument(*a, **kw) for a, kw in key_args]; p_extract.set_defaults(func=handle_cli_extract)
     p_inject = subparsers.add_parser('inject', help='Rebuild ARC files from folders.'); p_inject.add_argument('folders', metavar='FOLDER', type=str, nargs='+', help='Path(s) to source folder(s).'); p_inject.add_argument('--output-dir', '-o', type=str, required=True, help='Directory for rebuilt ARCs.'); [p_inject.add_argument(*a, **kw) for a, kw in key_args]; p_inject.set_defaults(func=handle_cli_inject)
     p_extract_rec = subparsers.add_parser('extract-recursive', help='Recursively extract ARCs.'); p_extract_rec.add_argument('source_dir', type=str, help='Root directory to scan.'); [p_extract_rec.add_argument(*a, **kw) for a, kw in key_args]; p_extract_rec.set_defaults(func=handle_cli_extract_recursive)
-    p_inject_rec = subparsers.add_parser('inject-recursive', help='Recursively rebuild ARCs in-place.'); p_inject_rec.add_argument('source_dir', type=str, help='Root directory with ARCs and *_arc folders.'); [p_inject_rec.add_argument(*a, **kw) for a, kw in key_args]; p_inject_rec.set_defaults(func=handle_cli_inject_recursive)
+    p_inject_rec = subparsers.add_parser('inject-recursive', help='Recursively rebuild ARCs in-place.'); p_inject_rec.add_argument('source_dir', type=str, help='Root directory with ARCs and *_arc folders.'); p_inject_rec.add_argument('--move-originals', action='store_true', help='On success, move original ARC backup and source folder to an "original_data" subfolder.'); [p_inject_rec.add_argument(*a, **kw) for a, kw in key_args]; p_inject_rec.set_defaults(func=handle_cli_inject_recursive)
     p_extract_flat = subparsers.add_parser('extract-flat', help='Extract all files from ARC(s) into one flat directory.'); p_extract_flat.add_argument('source_path', type=str, help='Path to an ARC file or a directory to scan.'); p_extract_flat.add_argument('--output-dir', '-o', type=str, required=True, help='Directory for all extracted files.'); [p_extract_flat.add_argument(*a, **kw) for a, kw in key_args]; p_extract_flat.set_defaults(func=handle_cli_extract_flat)
     
     args = parser.parse_args()

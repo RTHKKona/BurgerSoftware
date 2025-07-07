@@ -15,7 +15,7 @@ ECHO Starting compilation...
 ECHO This may take a few moments.
 ECHO.
 
-pyinstaller --noconfirm --onefile --windowed --name "SaladSoftware" ^
+pyinstaller --noconfirm --onefile --windowed --name "SaladSoftware_2.1" ^
 --icon="salad_icon.ico" ^
 --add-data="unique_extensions.txt;." ^
 --add-data="extension_index_line.txt;." ^
@@ -27,7 +27,7 @@ ECHO              COMPILATION COMPLETE
 ECHO ================================================
 ECHO.
 ECHO Your file can be found in the 'dist' folder:
-ECHO     dist\SaladSoftware.exe
+ECHO     dist\SaladSoftware_2.1.exe
 ECHO.
 ECHO Cleaning up temporary build files...
 rmdir /S /Q build
