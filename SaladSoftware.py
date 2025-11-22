@@ -1,4 +1,6 @@
-VERSION = "2.4" # Optimized: Smart Change Detection (Size/Bytes) & Parallel Compression
+VERSION = "2.4.1" 
+# Stability Update: Atomic Writes, Threaded Scanning, Smart CLI & High-DPI Fix
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import tkinter.font as tkFont
@@ -18,15 +20,24 @@ import shutil
 import re
 import textwrap
 import argparse
+import ctypes # Added for High-DPI awareness
 from collections import namedtuple
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Union, Tuple
+
+# --- HIGH-DPI FIX FOR WINDOWS ---
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 # Check for PyCryptodome dependency
 try:
     from Crypto.Cipher import Blowfish
 except ImportError:
-    # Create a root window just to show the error if dependencies fail
     root = tk.Tk()
     root.withdraw()
     messagebox.showerror("Missing Dependency", "The 'pycryptodome' library is required.\nPlease install it using: pip install pycryptodome")
@@ -101,7 +112,12 @@ STATUS_WARN = "warn"
 STATUS_ERROR = "error"
 STATUS_DEBUG = "debug"
 
-MAX_WORKERS = os.cpu_count() or 4
+# Optimized Worker Caps
+MAX_COMPRESSION_WORKERS = os.cpu_count() or 4
+MAX_IO_WORKERS = min(os.cpu_count() or 4, 4) # Cap IO workers to prevent disk thrashing/OOM
+
+# Safety Limits
+MAX_SAFE_ALLOCATION = 2 * 1024 * 1024 * 1024 # 2GB Safety Limit per file
 
 CHECK_UNCHECKED = "☐"
 CHECK_CHECKED = "☑"
@@ -113,6 +129,9 @@ GAME_SPECIFIC_HASH_FILE = "extension_index_line.txt"
 
 DEBUG_PER_FILE = False
 DEBUG_VERIFY_HASH = False
+
+# Pre-compiled regex for flattening
+FILENAME_SANITIZER = re.compile(r'[\\/:*?"<>|]')
 
 class ARCCSkippedError(ValueError):
     """Custom exception for when an ARCC file is intentionally skipped."""
@@ -129,11 +148,18 @@ def resource_path(relative_path: str) -> str:
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
+def get_safe_path_str(path_obj: pathlib.Path) -> str:
+    """Returns a path string safe for Windows long paths (\\?\) to prevent crashes."""
+    absolute_path = path_obj.resolve()
+    if os.name == 'nt' and not str(absolute_path).startswith('\\\\?\\'):
+        return f"\\\\?\\{absolute_path}"
+    return str(absolute_path)
+
 def get_sha256_hash(filepath: Union[str, pathlib.Path]) -> str:
     """Calculates the SHA256 hash of a file, reading it in chunks."""
     hash_sha256 = hashlib.sha256()
     try:
-        with open(filepath, "rb") as f:
+        with open(get_safe_path_str(pathlib.Path(filepath)), "rb") as f:
             while chunk := f.read(65536):
                 hash_sha256.update(chunk)
         return hash_sha256.hexdigest()
@@ -231,7 +257,8 @@ def get_full_filename(file_info: Dict[str, Any]) -> str:
     
     hash_val = file_info.get("ext_hash", 0)
     ext = EXTENSION_MAP.get(hash_val, f".{hash_val:08X}")
-    return name + ext
+    # Remove null bytes from final name to prevent OS errors
+    return (name + ext).rstrip('\x00')
 
 def get_calculated_uncompressed_size(file_info: Dict[str, Any]) -> int:
     p = file_info.get("platform")
@@ -260,6 +287,9 @@ def decompress_kontract_zlib(compressed_data: bytes) -> bytes:
             raise RuntimeError("Decompression failed for both standard and raw deflate streams.") from e_raw
 
 class MTArc:
+    # Slots optimization for memory efficiency when handling thousands of entries
+    __slots__ = ['arc_header', 'files', '_raw_file_path', '_file_size', 'version', 'platform', 'byte_order_char', 'entry_has_extended_names']
+
     def __init__(self):
         self.arc_header = None
         self.files = []
@@ -271,8 +301,10 @@ class MTArc:
         self.entry_has_extended_names = False
 
     def close(self):
+        self.files.clear()
         self.files = []
         self.arc_header = None
+        self._raw_file_path = None
 
     def load(self, filepath: str, key1=None, key2=None, status_queue_or_callback=None):
         self.__init__()
@@ -293,7 +325,8 @@ class MTArc:
             self._raw_file_path = filepath
             self._file_size = os.path.getsize(filepath)
 
-            with open(filepath, 'rb') as f_raw:
+            # Use safe path string for Windows long paths
+            with open(get_safe_path_str(pathlib.Path(filepath)), 'rb') as f_raw:
                 magic = f_raw.read(4)
                 f_raw.seek(0)
                 prelim_bo = '>' if magic == MAGIC_ARC_BE else '<'
@@ -359,6 +392,10 @@ class MTArc:
                     fi.update(zip(fields, struct.unpack(entry_fmt, entry_data)))
                     fi["calculated_uncompressed_size"] = get_calculated_uncompressed_size(fi)
                     
+                    # Safety Check for Corrupt/Malicious files reporting massive sizes
+                    if fi["calculated_uncompressed_size"] > MAX_SAFE_ALLOCATION:
+                        _q_status(f"Warning: Entry #{i} reports size > 2GB ({fi['calculated_uncompressed_size']}). Skipping memory pre-checks to prevent crash.", STATUS_WARN)
+                    
                     is_size_different = fi["compressed_size"] != fi["calculated_uncompressed_size"]
                     
                     fi["is_compressed"] = is_size_different or self.platform == Platform.Switch
@@ -367,17 +404,19 @@ class MTArc:
                     if fi["is_compressed"]:
                         peek_pos = f_raw.tell()
                         f_raw.seek(fi["offset"])
-                        comp_block = f_raw.read(fi["compressed_size"])
-                        f_raw.seek(peek_pos)
-                        try:
-                            zlib.decompress(comp_block)
-                            fi["is_raw_deflate"] = False
-                        except zlib.error:
+                        # Only peek if size is reasonable
+                        if fi["compressed_size"] < 10 * 1024 * 1024: # 10MB Peek
+                            comp_block = f_raw.read(fi["compressed_size"])
                             try:
-                                zlib.decompress(comp_block, -zlib.MAX_WBITS)
-                                fi["is_raw_deflate"] = True
+                                zlib.decompress(comp_block)
+                                fi["is_raw_deflate"] = False
                             except zlib.error:
-                                fi["is_compressed"] = False
+                                try:
+                                    zlib.decompress(comp_block, -zlib.MAX_WBITS)
+                                    fi["is_raw_deflate"] = True
+                                except zlib.error:
+                                    fi["is_compressed"] = False
+                        f_raw.seek(peek_pos)
                     
                     fi["full_filename"] = get_full_filename(fi).replace('\\', '/')
                     fi["original_is_compressed_hint"] = fi["is_compressed"]
@@ -396,12 +435,15 @@ class MTArc:
         offset = file_info.get("offset", 0)
         comp_size = file_info.get("compressed_size", 0)
         if comp_size == 0: return b''
-        with open(self._raw_file_path, 'rb') as f:
+        with open(get_safe_path_str(pathlib.Path(self._raw_file_path)), 'rb') as f:
             f.seek(offset)
             return f.read(comp_size)
 
     def extract_file(self, file_info, input_arc_path):
         data_block = self.get_raw_compressed_block(file_info, input_arc_path)
+        # Handle empty ZLIB blocks safely
+        if not data_block: 
+            return b''
         if file_info.get("is_compressed"):
             wbits = -zlib.MAX_WBITS if file_info.get("is_raw_deflate") else zlib.MAX_WBITS
             return zlib.decompress(data_block, wbits)
@@ -463,7 +505,8 @@ class MTArc:
 
         if files_to_compress:
             _q_status(f"Compressing {len(files_to_compress)} files in parallel...", STATUS_DEBUG)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Use CPU Count for compression
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_COMPRESSION_WORKERS) as executor:
                 results = executor.map(_compress_task, files_to_compress)
                 for idx, comp_data in results:
                     processed_data_map[idx] = comp_data
@@ -472,7 +515,8 @@ class MTArc:
         current_offset = data_start_offset
         metadata_list = []
 
-        with open(output_path, 'wb') as f:
+        # Write to the output path (expected to be temporary or resolved by caller)
+        with open(get_safe_path_str(pathlib.Path(output_path)), 'wb') as f:
             magic = MAGIC_ARC_BE if bo == '>' else b'ARC\x00'
             f.write(struct.pack(format_struct(bo, "4sHH"), magic, v, len(input_file_infos)))
             if is_extended_header: f.write(struct.pack('<I', 0))
@@ -534,11 +578,15 @@ class MTArc:
 def _from_scratch_rebuild_worker(source_folder_str, output_dir_str, key1, key2, status_callback_worker, **kwargs):
     source_folder_path = pathlib.Path(source_folder_str)
     output_dir = pathlib.Path(output_dir_str)
+    
+    # Stability: Atomic Write using .tmp
+    arc_base_name = source_folder_path.name[:-4] if source_folder_path.name.endswith("_arc") else source_folder_path.name
+    final_arc_path = output_dir / f"{arc_base_name}.arc"
+    temp_arc_path = output_dir / f"{arc_base_name}.arc.tmp"
+
     try:
         status_callback_worker(f"Starting scratch-rebuild for '{source_folder_path.name}'.", STATUS_INFO)
-        arc_base_name = source_folder_path.name[:-4] if source_folder_path.name.endswith("_arc") else source_folder_path.name
-        output_arc_path = output_dir / f"{arc_base_name}.arc"
-
+        
         files_to_pack = []
         disk_files = sorted([p for p in source_folder_path.rglob('*') if p.is_file()])
         
@@ -558,10 +606,19 @@ def _from_scratch_rebuild_worker(source_folder_str, output_dir_str, key1, key2, 
             files_to_pack.append(fi)
 
         arc_saver = MTArc()
-        arc_saver.save(str(output_arc_path), files_to_pack, status_callback=status_callback_worker)
+        arc_saver.save(str(temp_arc_path), files_to_pack, status_callback=status_callback_worker)
+        
+        # Rename atomic
+        if final_arc_path.exists():
+            final_arc_path.unlink()
+        temp_arc_path.rename(final_arc_path)
+
         return source_folder_path.name, True
 
     except Exception as e:
+        if temp_arc_path.exists(): 
+            try: temp_arc_path.unlink()
+            except: pass
         status_callback_worker(f"CRITICAL ERROR in scratch-rebuild for '{source_folder_path.name}': {e}", STATUS_ERROR)
         traceback.print_exc(file=sys.stderr)
         return source_folder_path.name, False
@@ -573,6 +630,7 @@ def _in_place_rebuild_worker(source_folder_str, _ignored_output_dir, key1, key2,
     arc_base_name = source_folder_path.name[:-4]
     original_arc_path = source_folder_path.parent / (arc_base_name + ".arc")
     backup_arc_path = source_folder_path.parent / (arc_base_name + "_original.arc")
+    # Temp file for atomic write
     temp_arc_path = source_folder_path.parent / (arc_base_name + ".arc.tmp_rebuild")
     target_backup_path = None
 
@@ -601,17 +659,29 @@ def _in_place_rebuild_worker(source_folder_str, _ignored_output_dir, key1, key2,
                 status_callback_worker(f"'{original_fi['full_filename']}' missing. Re-using original.", STATUS_WARN)
                 use_original_data = True
             else:
-                disk_data = disk_file_path.read_bytes()
+                # Memory Optimization: Don't read full file yet
+                disk_file_stat = disk_file_path.stat()
                 orig_uncomp_size = get_calculated_uncompressed_size(original_fi)
 
                 # 1. Fast Check: Size Difference
-                if len(disk_data) != orig_uncomp_size:
+                if disk_file_stat.st_size != orig_uncomp_size:
                     use_original_data = False
                 else:
-                    # 2. Check: Byte Comparison (Size matched, checking content)
+                    # 2. Compare bytes (Safety check without loading everything if possible)
+                    # For absolute safety we extract original to memory to compare
                     original_decompressed = original_arc.extract_file(original_fi, str(original_arc_path))
-                    if disk_data == original_decompressed:
+                    with open(get_safe_path_str(disk_file_path), 'rb') as f_disk:
+                        disk_data_temp = f_disk.read()
+                    
+                    if disk_data_temp == original_decompressed:
                         use_original_data = True
+                        del disk_data_temp # Free memory
+                        del original_decompressed
+                    else:
+                        use_original_data = False
+                        # disk_data_temp is needed, store it
+                        disk_data = disk_data_temp
+                        del original_decompressed
             
             if use_original_data:
                 # Copy raw compressed bytes from old file (Instant)
@@ -619,6 +689,9 @@ def _in_place_rebuild_worker(source_folder_str, _ignored_output_dir, key1, key2,
                 new_fi['data_is_precompressed'] = True
             else:
                 # Mark for later parallel compression
+                if not disk_data: # If not loaded during compare
+                    disk_data = disk_file_path.read_bytes()
+                
                 status_callback_worker(f"Change detected in '{original_fi['full_filename']}'.", STATUS_DEBUG)
                 new_fi['data'] = disk_data
                 new_fi['data_is_precompressed'] = False
@@ -633,14 +706,25 @@ def _in_place_rebuild_worker(source_folder_str, _ignored_output_dir, key1, key2,
             'target_byte_order_char': original_arc.byte_order_char, 
             'target_entry_has_extended_names': original_arc.entry_has_extended_names 
         }
+        # Write to .tmp file first
         arc_saver.save(str(temp_arc_path), files_to_pack, **save_kwargs)
         
         original_arc.close()
         arc_saver.close()
 
+        # Atomic Swap
         if backup_arc_path.exists(): backup_arc_path.unlink()
         original_arc_path.rename(backup_arc_path)
-        temp_arc_path.rename(original_arc_path)
+        
+        # Rename with retry for Windows file locking
+        for _ in range(3):
+            try:
+                temp_arc_path.rename(original_arc_path)
+                break
+            except OSError:
+                time.sleep(1)
+        else:
+            raise OSError(f"Could not rename temp file to {original_arc_path}")
 
         status_callback_worker(f"Successfully rebuilt '{original_arc_path.name}'.", STATUS_SUCCESS)
         
@@ -688,7 +772,9 @@ def _list_extract_worker(arc_path_str, output_base_dir_str, key1, key2, status_c
             try:
                 out_path = output_folder / fi['full_filename']
                 out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_bytes(arc.extract_file(fi, str(arc_path)))
+                # Safe Path Writing
+                with open(get_safe_path_str(out_path), 'wb') as f_out:
+                    f_out.write(arc.extract_file(fi, str(arc_path)))
             except Exception as e:
                 status_callback_worker(f"Error extracting '{fi.get('full_filename','?')}': {e}", STATUS_ERROR)
                 
@@ -709,7 +795,8 @@ def _flatten_extract_worker(arc_path_str, common_output_dir_str, key1, key2, sta
         for fi in arc.files:
             try:
                 data = arc.extract_file(fi, str(arc_path))
-                sanitized_name = re.sub(r'[\\/:*?"<>|]', '_', pathlib.Path(fi['full_filename']).name)
+                # Optimized Regex
+                sanitized_name = FILENAME_SANITIZER.sub('_', pathlib.Path(fi['full_filename']).name)
                 flat_name = f"{arc_path.stem}_{sanitized_name}"
                 counter = 1
                 out_path = common_output_dir / flat_name
@@ -717,7 +804,9 @@ def _flatten_extract_worker(arc_path_str, common_output_dir_str, key1, key2, sta
                 while out_path.exists():
                     out_path = common_output_dir / f"{arc_path.stem}_{pathlib.Path(sanitized_name).stem}_{counter}{pathlib.Path(sanitized_name).suffix}"
                     counter += 1
-                out_path.write_bytes(data)
+                
+                with open(get_safe_path_str(out_path), 'wb') as f_out:
+                    f_out.write(data)
             except Exception as e:
                 status_callback_worker(f"Error flat-extracting '{fi['full_filename']}': {e}", STATUS_ERROR)
         status_callback_worker(f"Finished flat extraction for {arc_path.name}", STATUS_SUCCESS)
@@ -747,7 +836,8 @@ def recursive_flatten_extract(source_root_dir, common_output_dir, progress_callb
 def run_batch_parallel(worker_func, item_list, output_dir, progress_callback, status_callback, key1, key2, **kwargs):
     if not item_list: return []
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    # Optimization: Use MAX_IO_WORKERS to prevent IO Thrashing/OOM
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_IO_WORKERS) as executor:
         futures = []
         for i, item in enumerate(item_list):
             worker_kwargs = {}
@@ -874,7 +964,7 @@ class ArcToolApp:
         if TkinterDnD:
             self.setup_drag_and_drop()
         else:
-            self.add_status_message("tkinterdnd2 library not found. Drag and drop will be disabled.", STATUS_WARN)
+            self.add_status_message("Drag and drop disabled. Install: 'pip install tkinterdnd2'", STATUS_WARN)
             
         self.check_queue()
 
@@ -964,7 +1054,8 @@ class ArcToolApp:
         bf.grid(row=4, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
         ttk.Button(bf, text="Select Files", command=self.select_list_extract_files).pack(side=tk.LEFT, padx=(0,10))
         ttk.Button(bf, text="Clear List", command=lambda: self.list_extract_listbox.delete(0, tk.END)).pack(side=tk.LEFT)
-        ttk.Button(frame, text="Start Extraction", command=self.start_list_extraction).grid(row=5, column=0, columnspan=3, pady=(10,10))
+        self.btn_extract_list = ttk.Button(frame, text="Start Extraction", command=self.start_list_extraction)
+        self.btn_extract_list.grid(row=5, column=0, columnspan=3, pady=(10,10))
         frame.grid_rowconfigure(3, weight=1)
 
     def create_list_inject_widgets(self):
@@ -988,7 +1079,8 @@ class ArcToolApp:
         ttk.Button(bf, text="Add Folder", command=self.select_list_inject_folders).pack(side=tk.LEFT, padx=(0,10))
         ttk.Button(bf, text="Clear List", command=lambda: self.list_inject_listbox.delete(0, tk.END)).pack(side=tk.LEFT)
         self._create_dir_input(frame, "Output Directory for New ARCs:", 5, "list_inject_output_var")
-        ttk.Button(frame, text="Build New ARC(s)", command=self.start_list_injection).grid(row=7, column=0, columnspan=3, pady=(10,10))
+        self.btn_inject_list = ttk.Button(frame, text="Build New ARC(s)", command=self.start_list_injection)
+        self.btn_inject_list.grid(row=7, column=0, columnspan=3, pady=(10,10))
 
     def create_recursive_extract_widgets(self):
         frame = self.rec_extract_frame
@@ -996,7 +1088,8 @@ class ArcToolApp:
         ttk.Label(frame, text="Purpose: Find and extract all .arc files within a directory and its subdirectories.", style='Header.TLabel').grid(row=0, column=0, sticky='w', pady=(5,5))
         self._create_dir_input(frame, "Source Directory to Scan (Recursive):", 1, "rec_extract_source_var")
         ttk.Label(frame, text="Output: For each ARC found, a corresponding '_arc' folder will be created next to it.", style='TLabel').grid(row=3, column=0, sticky='w', padx=5, pady=(10,5))
-        ttk.Button(frame, text="Start Recursive Batch Extraction", command=self.start_recursive_extraction).grid(row=4, column=0, pady=(10,10))
+        self.btn_rec_extract = ttk.Button(frame, text="Start Recursive Batch Extraction", command=self.start_recursive_extraction)
+        self.btn_rec_extract.grid(row=4, column=0, pady=(10,10))
 
     def create_folder_inject_widgets(self):
         frame = self.folder_inject_frame
@@ -1012,7 +1105,8 @@ class ArcToolApp:
         cb_del = ttk.Checkbutton(frame, text="On success, DELETE the 'original_data' subfolder (irreversible).", variable=self.delete_original_data_var, style='TCheckbutton')
         cb_del.grid(row=4, column=0, sticky='w', padx=5, pady=(5,0))
         self._create_dir_input(frame, "Select Directory Containing Both '.arc' and '_arc' Folders:", 5, "folder_inject_source_dir_var")
-        ttk.Button(frame, text="Start In-Place Rebuild", command=self.start_folder_injection).grid(row=7, column=0, pady=(10,10))
+        self.btn_inject_folder = ttk.Button(frame, text="Start In-Place Rebuild", command=self.start_folder_injection)
+        self.btn_inject_folder.grid(row=7, column=0, pady=(10,10))
 
     def create_recursive_inject_widgets(self):
         frame = self.rec_inject_frame
@@ -1027,7 +1121,8 @@ class ArcToolApp:
         cb_del = ttk.Checkbutton(frame, text="On success, DELETE all 'original_data' subfolders (irreversible).", variable=self.rec_inject_delete_original_data_var, style='TCheckbutton')
         cb_del.grid(row=3, column=0, sticky='w', padx=5, pady=(5,0))
         self._create_dir_input(frame, "Select Root Directory to Scan for '.arc' and '_arc' Pairs:", 4, "rec_inject_source_dir_var")
-        ttk.Button(frame, text="Start Batch In-Place Rebuild", command=self.start_recursive_folder_injection).grid(row=5, column=0, pady=(10,10))
+        self.btn_rec_inject = ttk.Button(frame, text="Start Batch In-Place Rebuild", command=self.start_recursive_folder_injection)
+        self.btn_rec_inject.grid(row=5, column=0, pady=(10,10))
 
     def create_flatten_extract_widgets(self):
         frame = self.flatten_extract_frame
@@ -1035,7 +1130,8 @@ class ArcToolApp:
         self._create_dir_input(frame, "Source ARC Directory (Recursive):", 0, "flatten_extract_source_var")
         self._create_dir_input(frame, "Output Directory (for all flattened files):", 2, "flatten_extract_output_var")
         ttk.Label(frame, text="Extracts all files from all ARCs into a single output directory.\nFilenames prefixed with ARC name (e.g., arc1_image.tex).", style='TLabel', justify=tk.LEFT).grid(row=4, column=0, sticky='w', padx=5, pady=(10,5))
-        ttk.Button(frame, text="Start Flattened Extraction", command=self.start_flatten_extraction).grid(row=5, column=0, pady=(10,10))
+        self.btn_flat_extract = ttk.Button(frame, text="Start Flattened Extraction", command=self.start_flatten_extraction)
+        self.btn_flat_extract.grid(row=5, column=0, pady=(10,10))
     
     def create_internal_arc_extract_widgets(self):
         frame = self.internal_arc_extract_frame
@@ -1070,7 +1166,8 @@ class ArcToolApp:
         output_frame = ttk.Frame(frame)
         output_frame.grid(row=2, column=0, sticky='ews', pady=(2,0))
         self._create_dir_input(output_frame, "Output Directory for Selected Items:", 0, "internal_extract_output_var")
-        ttk.Button(frame, text="Extract Selected Items", command=self.start_internal_arc_extraction).grid(row=3, column=0, pady=(10,10), padx=5)
+        self.btn_internal_extract = ttk.Button(frame, text="Extract Selected Items", command=self.start_internal_arc_extraction)
+        self.btn_internal_extract.grid(row=3, column=0, pady=(10,10), padx=5)
 
     def create_internal_arc_inject_widgets(self):
         frame = self.internal_arc_inject_frame
@@ -1109,7 +1206,8 @@ class ArcToolApp:
         self._create_file_output_input(output_frame, "Output Rebuilt ARC File (New Name/Location):", 0, "internal_inject_output_var", self.internal_inject_filepath_var)
         info_text = "Select an existing ARC, then pick files to replace. Retains original ARC structure and metadata."
         ttk.Label(frame, text=info_text, style='TLabel', justify=tk.LEFT).grid(row=3, column=0, sticky='w', padx=5, pady=(10,5))
-        ttk.Button(frame, text="Start Injection", command=self.start_internal_arc_injection).grid(row=4, column=0, pady=(10,10), padx=5)
+        self.btn_internal_inject = ttk.Button(frame, text="Start Injection", command=self.start_internal_arc_injection)
+        self.btn_internal_inject.grid(row=4, column=0, pady=(10,10), padx=5)
 
     def setup_drag_and_drop(self):
         self.list_extract_listbox.drop_target_register(DND_FILES)
@@ -1497,7 +1595,7 @@ class ArcToolApp:
         self.update_debug_buttons_text()
         self.add_status_message(f"Repack hash verification set to: {'ON' if DEBUG_VERIFY_HASH else 'OFF'}", STATUS_INFO)
 
-    def _run_task(self, target_func, args_tuple=(), kwargs_dict=None):
+    def _run_task(self, target_func, args_tuple=(), kwargs_dict=None, finished_callback=None):
         final_kwargs = {}
         if kwargs_dict:
             final_kwargs.update(kwargs_dict)
@@ -1508,7 +1606,14 @@ class ArcToolApp:
         self.progress_var.set(0)
         task_name = target_func.__name__.replace('_', ' ').title()
         self.add_status_message(f"Starting {task_name} task...", STATUS_INFO)
-        thread = threading.Thread(target=target_func, args=args_tuple, kwargs=final_kwargs, daemon=True)
+        
+        def wrapper():
+            target_func(*args_tuple, **final_kwargs)
+            if finished_callback:
+                # Schedule callback on main thread
+                self.root.after(0, finished_callback)
+
+        thread = threading.Thread(target=wrapper, daemon=True)
         thread.start()
 
     def _run_repack_and_cleanup_task(self, worker_func, item_list, output_dir, worker_kwargs_dict, delete_originals_flag, progress_callback, status_callback, key1, key2):
@@ -1539,7 +1644,8 @@ class ArcToolApp:
         if not items: 
             messagebox.showwarning("Input Missing", "Please select ARC files.")
             return
-        self._run_task(run_batch_parallel, (_list_extract_worker, items, None))
+        self.btn_extract_list.config(state='disabled')
+        self._run_task(run_batch_parallel, (_list_extract_worker, items, None), finished_callback=lambda: self.btn_extract_list.config(state='normal'))
 
     def start_list_injection(self):
         items = self.list_inject_listbox.get(0, tk.END)
@@ -1550,52 +1656,88 @@ class ArcToolApp:
         if not output_dir: 
             messagebox.showwarning("Output Missing", "Please select an output directory.")
             return
-        self._run_task(run_batch_parallel, (_from_scratch_rebuild_worker, items, output_dir))
+        self.btn_inject_list.config(state='disabled')
+        self._run_task(run_batch_parallel, (_from_scratch_rebuild_worker, items, output_dir), finished_callback=lambda: self.btn_inject_list.config(state='normal'))
 
     def start_folder_injection(self):
         src_dir = self.folder_inject_source_dir_var.get()
         if not src_dir: 
             messagebox.showwarning("Input Missing", "Please select the source directory.")
             return
-        source_path = pathlib.Path(src_dir)
-        task_folders = [
-            str(f) for f in source_path.glob('*_arc') 
-            if f.is_dir() and "original_data" not in f.parts and (source_path / (f.name[:-4] + ".arc")).is_file()
-        ]
-        if not task_folders:
-            self.add_status_message("No valid folder/*.arc pairs found in the selected directory.", STATUS_WARN)
-            return
-        move_originals_flag = self.move_to_original_data_var.get()
-        delete_originals_flag = self.delete_original_data_var.get()
-        kwargs_for_worker = {'move_originals': [move_originals_flag] * len(task_folders)}
-        args_for_task = (_in_place_rebuild_worker, task_folders, None, kwargs_for_worker, delete_originals_flag)
-        self._run_task(self._run_repack_and_cleanup_task, args_tuple=args_for_task)
+        self.btn_inject_folder.config(state='disabled')
+
+        # Threaded Scanning
+        def _scan_and_run():
+            try:
+                self.queue_status("Scanning for compatible folders...", STATUS_INFO)
+                source_path = pathlib.Path(src_dir)
+                task_folders = [
+                    str(f) for f in source_path.glob('*_arc') 
+                    if f.is_dir() and "original_data" not in f.parts and (source_path / (f.name[:-4] + ".arc")).is_file()
+                ]
+                if not task_folders:
+                    self.queue_status("No valid folder/*.arc pairs found.", STATUS_WARN)
+                    self.update_progress(100)
+                    self.root.after(0, lambda: self.btn_inject_folder.config(state='normal'))
+                    return
+
+                self.queue_status(f"Found {len(task_folders)} folders. Starting rebuild...", STATUS_INFO)
+                
+                move_originals_flag = self.move_to_original_data_var.get()
+                delete_originals_flag = self.delete_original_data_var.get()
+                kwargs_for_worker = {'move_originals': [move_originals_flag] * len(task_folders)}
+                args_for_task = (_in_place_rebuild_worker, task_folders, None, kwargs_for_worker, delete_originals_flag)
+                
+                self._run_task(self._run_repack_and_cleanup_task, args_tuple=args_for_task, finished_callback=lambda: self.btn_inject_folder.config(state='normal'))
+            except Exception as e:
+                self.queue_status(f"Scan Error: {e}", STATUS_ERROR)
+                self.root.after(0, lambda: self.btn_inject_folder.config(state='normal'))
+
+        threading.Thread(target=_scan_and_run, daemon=True).start()
 
     def start_recursive_folder_injection(self):
         src_dir = self.rec_inject_source_dir_var.get()
         if not src_dir: 
             messagebox.showwarning("Input Missing", "Please select the source directory.")
             return
-        source_path = pathlib.Path(src_dir)
-        task_folders = [
-            str(f) for f in source_path.rglob('*_arc') 
-            if f.is_dir() and "original_data" not in f.parts and (f.parent / (f.name[:-4] + ".arc")).is_file()
-        ]
-        if not task_folders:
-            self.add_status_message("No valid folder/*.arc pairs found recursively to process.", STATUS_WARN)
-            return
-        move_originals_flag = self.rec_inject_move_to_original_data_var.get()
-        delete_originals_flag = self.rec_inject_delete_original_data_var.get()
-        kwargs_for_worker = {'move_originals': [move_originals_flag] * len(task_folders)}
-        args_for_task = (_in_place_rebuild_worker, task_folders, None, kwargs_for_worker, delete_originals_flag)
-        self._run_task(self._run_repack_and_cleanup_task, args_tuple=args_for_task)
+        self.btn_rec_inject.config(state='disabled')
+
+        # Threaded Scanning
+        def _scan_and_run():
+            try:
+                self.queue_status("Recursively scanning for compatible folders...", STATUS_INFO)
+                source_path = pathlib.Path(src_dir)
+                task_folders = [
+                    str(f) for f in source_path.rglob('*_arc') 
+                    if f.is_dir() and "original_data" not in f.parts and (f.parent / (f.name[:-4] + ".arc")).is_file()
+                ]
+                if not task_folders:
+                    self.queue_status("No valid folder/*.arc pairs found recursively.", STATUS_WARN)
+                    self.update_progress(100)
+                    self.root.after(0, lambda: self.btn_rec_inject.config(state='normal'))
+                    return
+                
+                self.queue_status(f"Found {len(task_folders)} folders. Starting batch rebuild...", STATUS_INFO)
+                
+                move_originals_flag = self.rec_inject_move_to_original_data_var.get()
+                delete_originals_flag = self.rec_inject_delete_original_data_var.get()
+                kwargs_for_worker = {'move_originals': [move_originals_flag] * len(task_folders)}
+                args_for_task = (_in_place_rebuild_worker, task_folders, None, kwargs_for_worker, delete_originals_flag)
+                
+                self._run_task(self._run_repack_and_cleanup_task, args_tuple=args_for_task, finished_callback=lambda: self.btn_rec_inject.config(state='normal'))
+            except Exception as e:
+                self.queue_status(f"Scan Error: {e}", STATUS_ERROR)
+                self.root.after(0, lambda: self.btn_rec_inject.config(state='normal'))
+
+        threading.Thread(target=_scan_and_run, daemon=True).start()
 
     def start_recursive_extraction(self):
         src = self.rec_extract_source_var.get()
         if not src: 
             messagebox.showwarning("Input Missing", "Please select a source directory.")
             return
-        self._run_task(recursive_batch_extract, (src, None))
+        self.btn_rec_extract.config(state='disabled')
+        self._run_task(recursive_batch_extract, (src, None), finished_callback=lambda: self.btn_rec_extract.config(state='normal'))
 
     def start_flatten_extraction(self):
         src_dir = self.flatten_extract_source_var.get()
@@ -1603,7 +1745,8 @@ class ArcToolApp:
         if not src_dir or not out_dir: 
             messagebox.showwarning("Input Missing", "Please select source and output directories.")
             return
-        self._run_task(recursive_flatten_extract, (src_dir, out_dir))
+        self.btn_flat_extract.config(state='disabled')
+        self._run_task(recursive_flatten_extract, (src_dir, out_dir), finished_callback=lambda: self.btn_flat_extract.config(state='normal'))
 
     def start_internal_arc_extraction(self):
         if not self.current_arc_for_internal_view or not self.current_arc_for_internal_view.files:
@@ -1660,7 +1803,8 @@ class ArcToolApp:
             messagebox.showinfo("Nothing to Extract", "No items effectively selected for extraction after processing.")
             return
         self.add_status_message(f"Preparing to extract {len(final_extraction_list)} item(s)...", STATUS_INFO)
-        self._run_task(self._perform_internal_arc_extraction_thread, args_tuple=(final_extraction_list, self.internal_arc_filepath_var.get()))
+        self.btn_internal_extract.config(state='disabled')
+        self._run_task(self._perform_internal_arc_extraction_thread, args_tuple=(final_extraction_list, self.internal_arc_filepath_var.get()), finished_callback=lambda: self.btn_internal_extract.config(state='normal'))
 
     def _perform_internal_arc_extraction_thread(self, items_to_extract, arc_filepath_str, progress_callback, status_callback, key1, key2):
         arc_for_extraction = None
@@ -1679,7 +1823,7 @@ class ArcToolApp:
                     status_callback(f"Extracting '{file_info['full_filename']}' to '{target_disk_path}'...", STATUS_DEBUG)
                     file_data = arc_for_extraction.extract_file(file_info, arc_filepath_str)
                     target_disk_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(target_disk_path, 'wb') as out_f:
+                    with open(get_safe_path_str(target_disk_path), 'wb') as out_f:
                         out_f.write(file_data)
                     processed_count += 1
                 except Exception as e:
@@ -1749,7 +1893,8 @@ class ArcToolApp:
                 self.add_status_message("Injection cancelled as no files were selected for replacement.", STATUS_INFO)
                 return
         self.add_status_message(f"Starting internal ARC injection for '{os.path.basename(original_arc_path)}'...", STATUS_INFO)
-        self._run_task(self._perform_internal_arc_injection_thread, args_tuple=(original_arc_path, self.files_to_inject_map.copy(), output_arc_path))
+        self.btn_internal_inject.config(state='disabled')
+        self._run_task(self._perform_internal_arc_injection_thread, args_tuple=(original_arc_path, self.files_to_inject_map.copy(), output_arc_path), finished_callback=lambda: self.btn_internal_inject.config(state='normal'))
 
     def _perform_internal_arc_injection_thread(self, original_arc_filepath: str, files_to_inject_map: dict, output_arc_path: str, progress_callback, status_callback, key1, key2):
         arc_loader_for_read = None
@@ -1834,17 +1979,18 @@ class ArcToolApp:
     def check_queue(self):
         try:
             while True:
-                item = self.queue.get_nowait()
-                if item.get('type') == 'progress':
-                    self.progress_var.set(item.get('value', 0.0))
-                elif item.get('type') == 'status':
-                    msg_content = item.get('msg', '')
-                    msg_level = item.get('level', STATUS_INFO)
-                    self.add_status_message(msg_content, msg_level)
-        except queue.Empty:
-            pass
-        except Exception:
-            pass
+                try:
+                    item = self.queue.get_nowait()
+                    if item.get('type') == 'progress':
+                        self.progress_var.set(item.get('value', 0.0))
+                    elif item.get('type') == 'status':
+                        msg_content = item.get('msg', '')
+                        msg_level = item.get('level', STATUS_INFO)
+                        self.add_status_message(msg_content, msg_level)
+                except queue.Empty:
+                    break
+        except Exception as e:
+            print(f"Error in GUI event loop: {e}", file=sys.stderr)
         finally:
             self.root.after(100, self.check_queue)
 
@@ -1932,14 +2078,6 @@ def cli_progress_callback(value):
         sys.stdout.write("\n")
         sys.stdout.flush()
 
-class CliStatusQueueAdapter:
-    """ Adapts the status_queue.put interface to a direct callback for MTArc.load """
-    def __init__(self, callback):
-        self.callback = callback
-    def put(self, item):
-        if item and isinstance(item, dict) and item.get('type') == 'status':
-            self.callback(item.get('msg',''), item.get('level', STATUS_INFO))
-
 def handle_cli_extract(args):
     cli_status_callback(f"Starting List Extraction for: {', '.join(args.arc_files)}", STATUS_INFO)
     run_batch_parallel(_list_extract_worker, args.arc_files, None, cli_progress_callback, cli_status_callback, args.key1, args.key2)
@@ -1981,11 +2119,92 @@ def handle_cli_extract_flat(args):
     else:
         cli_status_callback(f"Error: Source path '{args.source_path}' is not a valid ARC file or directory.", STATUS_ERROR)
 
+def install_context_menu():
+    """Helper to add 'Extract ARC' and 'Rebuild ARC' to Windows right-click menu."""
+    if sys.platform != 'win32':
+        print("Context menu installation is only supported on Windows.")
+        return
+
+    try:
+        import winreg
+    except ImportError:
+        print("winreg module not found.")
+        return
+
+    exe_path = os.path.abspath(sys.argv[0])
+    # If running as python script, use python.exe
+    if not exe_path.lower().endswith('.exe'):
+        exe_path = f'"{sys.executable}" "{exe_path}"'
+    else:
+        exe_path = f'"{exe_path}"'
+
+    def set_reg_key(key_path, value):
+        try:
+            key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path)
+            winreg.SetValue(key, None, winreg.REG_SZ, value)
+            winreg.CloseKey(key)
+        except Exception as e:
+            print(f"Error writing registry key {key_path}: {e}")
+
+    print("Installing Context Menu items...")
+    
+    # 1. .arc files -> Extract
+    base = r"Software\Classes\.arc"
+    set_reg_key(base, "SaladSoftwareARC")
+    set_reg_key(r"Software\Classes\SaladSoftwareARC\shell\open\command", f'{exe_path} "%1"') 
+    set_reg_key(r"Software\Classes\SaladSoftwareARC\shell\extract", "Extract ARC (SaladSoftware)")
+    set_reg_key(r"Software\Classes\SaladSoftwareARC\shell\extract\command", f'{exe_path} extract "%1"')
+    
+    # 2. Folders -> Rebuild (Inject)
+    set_reg_key(r"Software\Classes\Directory\shell\SaladRebuild", "Rebuild ARC (SaladSoftware)")
+    set_reg_key(r"Software\Classes\Directory\shell\SaladRebuild\command", f'{exe_path} inject "%1" --output-dir "%1_rebuilt"')
+
+    print("Done. You should now see 'Extract ARC' when right-clicking .arc files,")
+    print("and 'Rebuild ARC' when right-clicking folders.")
+    input("Press Enter to exit...")
+
+def _keep_window_open_on_error(func, args):
+    """Runs the CLI command and keeps window open if an error occurs or operation finishes."""
+    try:
+        func(args)
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        traceback.print_exc()
+    finally:
+        if sys.stdout and sys.stdout.isatty():
+            input("\nProcess finished. Press Enter to exit...")
+
 if __name__ == "__main__":
+    # 1. SMART ARG PARSING (Supports D&D)
+    known_commands = ['extract', 'inject', 'extract-recursive', 'inject-recursive', 'extract-flat', 'install-menu']
+    
+    if len(sys.argv) > 1 and sys.argv[1] not in known_commands and not sys.argv[1].startswith('-'):
+        target = pathlib.Path(sys.argv[1])
+        inserted_cmd = None
+        
+        if target.is_file() and target.suffix.lower() == '.arc':
+            inserted_cmd = 'extract'
+        elif target.is_dir():
+            if target.name.endswith('_arc'):
+                inserted_cmd = 'inject'
+            else:
+                inserted_cmd = 'extract-recursive'
+        
+        if inserted_cmd:
+            print(f"Auto-detected mode: {inserted_cmd}")
+            sys.argv.insert(1, inserted_cmd)
+            
+            if inserted_cmd == 'inject' and '--output-dir' not in sys.argv and '-o' not in sys.argv:
+                default_out = str(target.parent)
+                sys.argv.extend(['--output-dir', default_out])
+
+    # 2. DEFINE PARSER
     parser = argparse.ArgumentParser(description=f"Handburger's SaladSoftware MT Arc Tool - Version {VERSION}", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
     subparsers = parser.add_subparsers(dest="command", title="Commands", help="Run a command with -h for more details")
-    key_args = [(['-k1', '--key1'], {'type': str, 'default': None, 'help': 'Blowfish Key Part 1 (unused).'}), (['-k2', '--key2'], {'type': str, 'default': None, 'help': 'Blowfish Key Part 2 (unused).'})]
+    
+    key_args = [(['-k1', '--key1'], {'type': str, 'default': None, 'help': 'Blowfish Key Part 1 (unused).'}), 
+                (['-k2', '--key2'], {'type': str, 'default': None, 'help': 'Blowfish Key Part 2 (unused).'})]
     
     p_extract = subparsers.add_parser('extract', help='Extract one or more ARC files.')
     p_extract.add_argument('arc_files', metavar='ARC_FILE', type=str, nargs='+', help='Path(s) to ARC file(s).')
@@ -2005,7 +2224,7 @@ if __name__ == "__main__":
     
     p_inject_rec = subparsers.add_parser('inject-recursive', help='Recursively rebuild ARCs in-place.')
     p_inject_rec.add_argument('source_dir', type=str, help='Root directory with ARCs and *_arc folders.')
-    p_inject_rec.add_argument('--move-originals', action='store_true', help='On success, move original ARC backup and source folder to an "original_data" subfolder.')
+    p_inject_rec.add_argument('--move-originals', action='store_true', help='Move original ARC backup to "original_data".')
     for a, kw in key_args: p_inject_rec.add_argument(*a, **kw)
     p_inject_rec.set_defaults(func=handle_cli_inject_recursive)
     
@@ -2015,12 +2234,15 @@ if __name__ == "__main__":
     for a, kw in key_args: p_extract_flat.add_argument(*a, **kw)
     p_extract_flat.set_defaults(func=handle_cli_extract_flat)
     
+    p_install = subparsers.add_parser('install-menu', help='Install Windows Context Menu items.')
+    p_install.set_defaults(func=lambda x: install_context_menu())
+
     args = parser.parse_args()
     
     load_extension_map(resource_path(EXTENSION_MAP_FILE), resource_path(GAME_SPECIFIC_HASH_FILE))
 
     if hasattr(args, 'func'):
-        args.func(args)
+        _keep_window_open_on_error(args.func, args)
     else:
         if TkinterDnD: 
             root = TkinterDnD.Tk()

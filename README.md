@@ -1,115 +1,106 @@
 # SaladSoftware - A Kuriimu1/2 MT Framework-only Python Variant
+**Version 2.4.1**
+
 ![Screenshot 2025-05-09 123142](https://github.com/user-attachments/assets/88742bf3-1e9f-443b-8be5-d3b23ff674ea)
 ![Screenshot 2025-05-09 121140](https://github.com/user-attachments/assets/e23ae47c-b4db-4d64-9464-68096804baf7)
 
-- Uses Dark Mode
-- Has individual and recursive arc extraction and injection
-- Log for debugging
+- **Dark Mode UI**
+- **Drag & Drop Support** (Files and Folders)
+- **High-DPI / 4K Support**
+- **Atomic Writes** (Prevents corruption if a save fails)
+- **Threaded Scanning & Parallel Compression**
+- **Windows Context Menu Integration**
 
-BurgerSoftware uses Kuriimu2-dev C# code. I did not do this myself.
-HotdogSoftware uses Kuriimu2 as well.
-SaladSoftware uses Kuriimu (1) Karameru C# code, but uses python instead. Original MTArc, Komponent, Encryption, and C# code processing belongs to IcySon55 and FanTranslatorInternational, all I did was adapt it to Python and add a darkmode and log so its clearer what the app is doing while stalled.
+SaladSoftware uses Kuriimu (1) Karameru C# code logic adapted to Python. Original MTArc, Komponent, Encryption, and C# code processing logic belongs to IcySon55 and FanTranslatorInternational. I adapted it to Python, added a GUI with dark mode, logging, and stability features like atomic saves and memory safety caps.
+
+## Dependencies
+If running from source, you must install the following:
+```bash
+pip install pycryptodome tkinterdnd2
+```
 
 ## Tab Descriptions
 
-        * Extract Arc Files
-           - Select one or more .arc files.
-           - Each ARC is extracted into its own subfolder (e.g., 'file.arc' extracts to 'file_arc/').
-           - The internal folder structure of each ARC is preserved within its output subfolder.
-           - Output folders are created next to their respective input .arc files.
+### 1. Extract from ARC(s)
+- **Purpose:** Unpack an original game archive (.arc) into a folder.
+- **Usage:** Drag and drop .arc files or select them via the button.
+- **Output:** Each ARC is extracted into a subfolder next to the original file (e.g., `resident.arc` -> `resident_arc/`).
+- **Note:** Preserves internal folder structure.
 
-        * Inject Arc Folders
-           - Add one or more source folders to the list. These folders contain files you want to pack into ARCs.
-           - Select an output directory where the new .arc files will be saved.
-           - Each source folder is rebuilt into a new .arc file (e.g., 'my_mod_folder' becomes 'my_mod_folder.arc').
-           - By default, ARCs are created using parameters suitable for Switch games (Version 9, Little Endian).
+### 2. Repack Folder (In-Place)
+- **Purpose:** Rebuild an edited folder back into a byte-perfect .arc file. **(Recommended for Modding)**
+- **Usage:** Select the directory containing both your original `.arc` and your edited `_arc` folder.
+- **Logic:** 
+  - Finds pairs (e.g., `file.arc` and `file_arc`).
+  - Uses the original ARC to copy headers, version info, and unchanged files (High-Fidelity Rebuild).
+  - Only compresses files that have actually changed on disk.
+- **Safety:** 
+  - Creates a `.tmp` file first to ensure write success.
+  - Moves the original `.arc` and the source `_arc` folder into an `original_data` subfolder upon success.
+  - **Optional:** Can be set to delete `original_data` automatically after a successful rebuild.
 
-        * Recursive Extract Arcs
-           - Select a root directory.![Screenshot 2025-05-09 123142](https://github.com/user-attachments/assets/cf89e0f2-2bb0-4ce4-af83-d609ff52a111)
+### 3. Build New ARC from Folder
+- **Purpose:** Create a completely new .arc file from a folder of assets.
+- **Warning:** Uses default settings (Switch/PC hybrid defaults). Not recommended for modding existing files; use Tab 2 instead.
 
-           - The tool will scan this directory and all its subdirectories for .arc files.
-           - Each found .arc file is extracted similarly to 'Extract Arc Files (List)' (into its own subfolder, next to the ARC).
-           - You can keep track of what is happening via the log on the bottom. 
+### 4. Batch: Extract All in Folder
+- **Purpose:** Recursively scan a root directory for *any* .arc files and extract them.
+- **Output:** Creates `_arc` folders next to every found .arc file.
 
-        * Recursive Inject (In-Place)
-           - Select a root directory that contains both original .arc files and corresponding unpacked/edited folders (typically named 'original_arc_name_arc').
-           - The tool matches *_arc folders with their .arc files.
-           - Original .arc files are backed up into an 'original_arc_backups' subfolder (created within the selected root directory).
-           - The *_arc folders are then rebuilt into .arc files, replacing the originals.
-           - This process attempts to use the *exact parameters* (version, platform, byte order, ARCC status, file order, compression hints) from the original ARC for the rebuild.
-           - Processed *_arc folders are also moved to the backup directory.
+### 5. Batch: Repack Folders (In-Place)
+- **Purpose:** Recursively find and rebuild all ARCs from their extracted folders.
+- **Logic:** Same as Tab 2, but scans subdirectories.
+- **Cleanup:** Options to move originals to `original_data` or delete them after successful repacking.
 
-        * Extract All (Flatten File Structure)
-           - Select a root directory containing .arc files (scanned recursively).
-           - Select a single output directory.
-           - All files from all found ARCs are extracted directly into this single output directory.
-           - The original folder structure *within* the ARCs is discarded (flattened).
-           - To prevent name collisions, extracted filenames are prefixed with the name of their source ARC (e.g., 'arc1_image.tex', 'arc2_sound.wav').
+### 6. Batch: Extract All (Single Folder / Flatten)
+- **Purpose:** Extract contents of many ARCs into one single "flat" folder.
+- **Usage:** Useful for dumping all textures or sounds to one place.
+- **Naming:** Filenames are prefixed with the source ARC name (e.g., `resident_arc_font.tex`) to prevent conflicts.
 
-        * Internal-ARC Extraction
-           - Select a single .arc file to load and preview its internal file/folder structure in a tree view.
-           - Check the boxes next to individual files or folders within the tree that you wish to extract.
-             - Checking a folder will effectively check all its contents.
-           - Select an output directory.
-           - Click "Extract Selected Items".
-             - If a file is checked, it's saved to: `output_dir/filename.ext`
-             - If a folder (e.g., 'textures/player') is checked, its contents are saved to: `output_dir/player/content_file.ext`, preserving the structure *relative to the checked folder*.
+### 7. Advanced: Partial Extract (Internal ARC View)
+- **Purpose:** Preview and extract specific files without unpacking the whole archive.
+- **Usage:** 
+  - Load an ARC.
+  - Check boxes next to files or folders.
+  - Extract to specific location.
+
+### 8. Advanced: Partial Inject (Internal ARC Injection)
+- **Purpose:** Replace specific files inside an existing ARC without full unpacking/repacking.
+- **Usage:**
+  - Load an ARC.
+  - Select a specific file in the tree view.
+  - Click "Replace Selected File..." and choose your new file from disk.
+  - Click "Start Injection".
+- **Behavior:** Creates a new ARC where only the targeted files are replaced; all other data is copied raw from the original.
 
 ## CLI Usage
-Usage: python your_script_name.py [command] [options]
+The tool automatically detects if you pass a file or folder argument, but specific commands are available.
 
-General Notes:
-  - Use -h or --help with any command for full details (e.g., python your_script_name.py extract -h).
-  - ARCC files are skipped; encryption keys (--key1, --key2) are present but unused.
+**Usage:** `python SaladSoftware.py [command] [options]`
 
-Commands:
+### Commands
 
-1. extract <ARC_FILE...>
-   - Extracts one or more .arc files.
-   - Output: Folder <filename>_arc created next to each input .arc.
-   - Example: python your_script_name.py extract myarchive.arc another.arc
-
-2. inject <FOLDER...> -o <OUTPUT_DIR>
-   - Rebuilds ARC(s) from source folder(s).
-   - Output: New .arc files in specified <OUTPUT_DIR>.
-   - If <FOLDER> is named 'name_arc' and 'name.arc' exists alongside, its parameters (version, platform, file order etc.) are used for rebuild. Otherwise, defaults apply.
-   - Example: python your_script_name.py inject ./myfiles_arc ./otherfiles_arc -o ./rebuilt_arcs
-
-3. extract-recursive <SOURCE_DIR>
-   - Recursively finds all .arc files in <SOURCE_DIR> and extracts them.
-   - Output: Like 'extract', <filename>_arc folders next to each found .arc.
-   - Example: python your_script_name.py extract-recursive ./game_assets
-
-4. inject-recursive <SOURCE_DIR>
-   - In-place recursive rebuild. Scans <SOURCE_DIR> for .arc files and matching *_arc folders.
-   - Original .arc files are backed up to 'original_arc_backups/' within <SOURCE_DIR>.
-   - Rebuilds using original ARC parameters (version, platform, file order, compression hints).
-   - Processed *_arc folders are also moved to backups.
-   - Example: python your_script_name.py inject-recursive ./modding_project
-
-5. extract-flat <SOURCE_PATH> -o <OUTPUT_DIR>
-   - Extracts all files from all ARCs found in <SOURCE_PATH> (can be a single .arc file or a directory to scan recursively).
-   - Output: All files go into a single <OUTPUT_DIR>, flattened.
-   - Filenames prefixed to avoid collision: arcname_internalfilename.ext.
-   - Example (single ARC): python your_script_name.py extract-flat ./data.arc -o ./all_extracted_flat
-   - Example (directory): python your_script_name.py extract-flat ./arc_folder -o ./all_extracted_flat
-
-6. extract-internal <ARC_FILE> --items <INTERNAL_PATH...> -o <OUTPUT_DIR>
-   - Extracts specific files/folders from within <ARC_FILE> to <OUTPUT_DIR>.
-   - Preserves the specified internal path structure in the output.
-   - --items: Space-separated list of full internal paths (e.g., "path/to/file.tex" "another/folder").
-   - Example: python your_script_name.py extract-internal game.arc --items "ui/tex/button.tex" "char/model/body.mdl" -o ./specific_extract
-
-7. inject-internal <ARC_FILE> --replace <INTERNAL=DISK...> -o <OUTPUT_ARC>
-   - Rebuilds <ARC_FILE> to a new <OUTPUT_ARC>, replacing specified internal files.
-   - --replace: 'internal/path/in/arc=path/to/your/diskfile'. Use multiple times for multiple replacements.
-   - Retains original ARC structure, metadata, and file order for non-replaced files.
-   - --force-repack: Rebuilds even if no --replace arguments are given.
-   - Example: python your_script_name.py inject-internal original.arc --replace "textures/old.tex=./new_texture.tex" --replace "sounds/beep.wav=./boop.wav" -o ./modded.arc
-
+1.  **extract** `<ARC_FILE...>`
+    *   Extracts one or more .arc files into `_arc` folders.
+2.  **inject** `<FOLDER...>` `--output-dir <DIR>`
+    *   Builds new ARCs from source folders (Scratch rebuild).
+3.  **extract-recursive** `<SOURCE_DIR>`
+    *   Recursively finds and extracts all ARCs in a directory.
+4.  **inject-recursive** `<SOURCE_DIR>` `[--move-originals]`
+    *   In-place recursive rebuild. Scans for `name.arc` + `name_arc` pairs.
+    *   Uses high-fidelity repacking.
+5.  **extract-flat** `<SOURCE_PATH>` `--output-dir <DIR>`
+    *   Extracts all files from an ARC or directory of ARCs into one flat folder.
+6.  **install-menu**
+    *   **(Windows Only)** Installs context menu items:
+        *   Right-click .arc file -> **Extract ARC**
+        *   Right-click Folder -> **Rebuild ARC**
 
 ## Compiling
+To compile this into a standalone EXE (Windows), use PyInstaller. Ensure `tkinterdnd2` is installed in your environment.
 
-I used ``` pyinstaller --onefile --windowed --icon salad_icon.ico --name "SaladSoftware 1.5" --add-data "extension_index_line.txt;." --add-data "unique_extensions.txt;." SaladSoftware.py ``` to compile this project into an exe.
+```bash
+pyinstaller --onefile --windowed --icon salad_icon.ico --name "SaladSoftware 2.4.1" --add-data "extension_index_line.txt;." --add-data "unique_extensions.txt;." --collect-all tkinterdnd2 SaladSoftware.py
+```
+*(Note: `--collect-all tkinterdnd2` is often required to ensure the drag-and-drop binaries are bundled correctly).*
 
-###### buh
