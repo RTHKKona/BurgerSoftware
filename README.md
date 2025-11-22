@@ -10,6 +10,7 @@
 - **Atomic Writes** (Prevents corruption if a save fails)
 - **Threaded Scanning & Parallel Compression**
 - **Windows Context Menu Integration**
+- **Support for double-click .arc Preview**
 
 SaladSoftware uses Kuriimu (1) Karameru C# code logic adapted to Python. Original MTArc, Komponent, Encryption, and C# code processing logic belongs to IcySon55 and FanTranslatorInternational. I adapted it to Python, added a GUI with dark mode, logging, and stability features like atomic saves and memory safety caps.
 
@@ -63,6 +64,7 @@ pip install pycryptodome tkinterdnd2
   - Load an ARC.
   - Check boxes next to files or folders.
   - Extract to specific location.
+- **Open up an .arc on Windows via double-click.**
 
 ### 8. Advanced: Partial Inject (Internal ARC Injection)
 - **Purpose:** Replace specific files inside an existing ARC without full unpacking/repacking.
