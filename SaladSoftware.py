@@ -1,4 +1,4 @@
-VERSION = "2.4.1" 
+VERSION = "2.4.2" 
 # Stability Update: Atomic Writes, Threaded Scanning, Smart CLI & High-DPI Fix
 
 import tkinter as tk
@@ -149,7 +149,7 @@ def resource_path(relative_path: str) -> str:
     return os.path.join(base_path, relative_path)
 
 def get_safe_path_str(path_obj: pathlib.Path) -> str:
-    """Returns a path string safe for Windows long paths (\\?\) to prevent crashes."""
+    #Returns a path string safe for Windows long paths (\\?\) to prevent crashes.
     absolute_path = path_obj.resolve()
     if os.name == 'nt' and not str(absolute_path).startswith('\\\\?\\'):
         return f"\\\\?\\{absolute_path}"
@@ -864,7 +864,7 @@ def run_batch_parallel(worker_func, item_list, output_dir, progress_callback, st
 
 # --- GUI AND CLI CODE ---
 class ArcToolApp:
-    def __init__(self, root):
+    def __init__(self, root, startup_file=None):
         self.root = root
         self.root.title("SaladSoftware ARC Tool")
         self.root.configure(bg=BG_COLOR)
@@ -967,6 +967,21 @@ class ArcToolApp:
             self.add_status_message("Drag and drop disabled. Install: 'pip install tkinterdnd2'", STATUS_WARN)
             
         self.check_queue()
+        # <--- 2. Added check for startup file
+        if startup_file:
+            # Small delay to ensure window is rendered before switching tabs
+            self.root.after(100, lambda: self.handle_startup_file(startup_file))
+
+    # <--- 3. Added new method to handle the switch
+    def handle_startup_file(self, filepath):
+        try:
+            self.add_status_message(f"Startup file detected: {os.path.basename(filepath)}", STATUS_INFO)
+            self.internal_arc_filepath_var.set(filepath)
+            self.load_arc_into_treeview(filepath)
+            # Select the Advanced Partial Extract tab
+            self.notebook.select(self.internal_arc_extract_frame)
+        except Exception as e:
+            self.add_status_message(f"Error loading startup file: {e}", STATUS_ERROR)
 
     def configure_styles(self):
         s = self.style
@@ -2175,15 +2190,20 @@ def _keep_window_open_on_error(func, args):
             input("\nProcess finished. Press Enter to exit...")
 
 if __name__ == "__main__":
-    # 1. SMART ARG PARSING (Supports D&D)
+    # 1. SMART ARG PARSING (Supports D&D and Double-Click)
     known_commands = ['extract', 'inject', 'extract-recursive', 'inject-recursive', 'extract-flat', 'install-menu']
     
+    gui_startup_file = None # Flag to track if we should skip CLI and go to GUI
+
+    # Check arguments before passing to argparse
     if len(sys.argv) > 1 and sys.argv[1] not in known_commands and not sys.argv[1].startswith('-'):
         target = pathlib.Path(sys.argv[1])
         inserted_cmd = None
         
         if target.is_file() and target.suffix.lower() == '.arc':
-            inserted_cmd = 'extract'
+            # If a single .arc file is passed, we assume the user wants to VIEW it in the GUI
+            # rather than automatically extracting it via CLI.
+            gui_startup_file = str(target)
         elif target.is_dir():
             if target.name.endswith('_arc'):
                 inserted_cmd = 'inject'
@@ -2198,55 +2218,65 @@ if __name__ == "__main__":
                 default_out = str(target.parent)
                 sys.argv.extend(['--output-dir', default_out])
 
-    # 2. DEFINE PARSER
-    parser = argparse.ArgumentParser(description=f"Handburger's SaladSoftware MT Arc Tool - Version {VERSION}", formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
-    subparsers = parser.add_subparsers(dest="command", title="Commands", help="Run a command with -h for more details")
-    
-    key_args = [(['-k1', '--key1'], {'type': str, 'default': None, 'help': 'Blowfish Key Part 1 (unused).'}), 
-                (['-k2', '--key2'], {'type': str, 'default': None, 'help': 'Blowfish Key Part 2 (unused).'})]
-    
-    p_extract = subparsers.add_parser('extract', help='Extract one or more ARC files.')
-    p_extract.add_argument('arc_files', metavar='ARC_FILE', type=str, nargs='+', help='Path(s) to ARC file(s).')
-    for a, kw in key_args: p_extract.add_argument(*a, **kw)
-    p_extract.set_defaults(func=handle_cli_extract)
-    
-    p_inject = subparsers.add_parser('inject', help='Rebuild ARC files from folders.')
-    p_inject.add_argument('folders', metavar='FOLDER', type=str, nargs='+', help='Path(s) to source folder(s).')
-    p_inject.add_argument('--output-dir', '-o', type=str, required=True, help='Directory for rebuilt ARCs.')
-    for a, kw in key_args: p_inject.add_argument(*a, **kw)
-    p_inject.set_defaults(func=handle_cli_inject)
-    
-    p_extract_rec = subparsers.add_parser('extract-recursive', help='Recursively extract ARCs.')
-    p_extract_rec.add_argument('source_dir', type=str, help='Root directory to scan.')
-    for a, kw in key_args: p_extract_rec.add_argument(*a, **kw)
-    p_extract_rec.set_defaults(func=handle_cli_extract_recursive)
-    
-    p_inject_rec = subparsers.add_parser('inject-recursive', help='Recursively rebuild ARCs in-place.')
-    p_inject_rec.add_argument('source_dir', type=str, help='Root directory with ARCs and *_arc folders.')
-    p_inject_rec.add_argument('--move-originals', action='store_true', help='Move original ARC backup to "original_data".')
-    for a, kw in key_args: p_inject_rec.add_argument(*a, **kw)
-    p_inject_rec.set_defaults(func=handle_cli_inject_recursive)
-    
-    p_extract_flat = subparsers.add_parser('extract-flat', help='Extract all files from ARC(s) into one flat directory.')
-    p_extract_flat.add_argument('source_path', type=str, help='Path to an ARC file or a directory to scan.')
-    p_extract_flat.add_argument('--output-dir', '-o', type=str, required=True, help='Directory for all extracted files.')
-    for a, kw in key_args: p_extract_flat.add_argument(*a, **kw)
-    p_extract_flat.set_defaults(func=handle_cli_extract_flat)
-    
-    p_install = subparsers.add_parser('install-menu', help='Install Windows Context Menu items.')
-    p_install.set_defaults(func=lambda x: install_context_menu())
-
-    args = parser.parse_args()
-    
     load_extension_map(resource_path(EXTENSION_MAP_FILE), resource_path(GAME_SPECIFIC_HASH_FILE))
 
-    if hasattr(args, 'func'):
-        _keep_window_open_on_error(args.func, args)
-    else:
+    # If we detected a file for GUI opening, skip argparse CLI logic
+    if gui_startup_file:
         if TkinterDnD: 
             root = TkinterDnD.Tk()
         else: 
             root = tk.Tk()
-        app = ArcToolApp(root)
+        # Pass the file to the App
+        app = ArcToolApp(root, startup_file=gui_startup_file)
         root.mainloop()
+    else:
+        # 2. DEFINE PARSER (Standard CLI Logic)
+        parser = argparse.ArgumentParser(description=f"Handburger's SaladSoftware MT Arc Tool - Version {VERSION}", formatter_class=argparse.RawTextHelpFormatter)
+        parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
+        subparsers = parser.add_subparsers(dest="command", title="Commands", help="Run a command with -h for more details")
+        
+        key_args = [(['-k1', '--key1'], {'type': str, 'default': None, 'help': 'Blowfish Key Part 1 (unused).'}), 
+                    (['-k2', '--key2'], {'type': str, 'default': None, 'help': 'Blowfish Key Part 2 (unused).'})]
+        
+        p_extract = subparsers.add_parser('extract', help='Extract one or more ARC files.')
+        p_extract.add_argument('arc_files', metavar='ARC_FILE', type=str, nargs='+', help='Path(s) to ARC file(s).')
+        for a, kw in key_args: p_extract.add_argument(*a, **kw)
+        p_extract.set_defaults(func=handle_cli_extract)
+        
+        p_inject = subparsers.add_parser('inject', help='Rebuild ARC files from folders.')
+        p_inject.add_argument('folders', metavar='FOLDER', type=str, nargs='+', help='Path(s) to source folder(s).')
+        p_inject.add_argument('--output-dir', '-o', type=str, required=True, help='Directory for rebuilt ARCs.')
+        for a, kw in key_args: p_inject.add_argument(*a, **kw)
+        p_inject.set_defaults(func=handle_cli_inject)
+        
+        p_extract_rec = subparsers.add_parser('extract-recursive', help='Recursively extract ARCs.')
+        p_extract_rec.add_argument('source_dir', type=str, help='Root directory to scan.')
+        for a, kw in key_args: p_extract_rec.add_argument(*a, **kw)
+        p_extract_rec.set_defaults(func=handle_cli_extract_recursive)
+        
+        p_inject_rec = subparsers.add_parser('inject-recursive', help='Recursively rebuild ARCs in-place.')
+        p_inject_rec.add_argument('source_dir', type=str, help='Root directory with ARCs and *_arc folders.')
+        p_inject_rec.add_argument('--move-originals', action='store_true', help='Move original ARC backup to "original_data".')
+        for a, kw in key_args: p_inject_rec.add_argument(*a, **kw)
+        p_inject_rec.set_defaults(func=handle_cli_inject_recursive)
+        
+        p_extract_flat = subparsers.add_parser('extract-flat', help='Extract all files from ARC(s) into one flat directory.')
+        p_extract_flat.add_argument('source_path', type=str, help='Path to an ARC file or a directory to scan.')
+        p_extract_flat.add_argument('--output-dir', '-o', type=str, required=True, help='Directory for all extracted files.')
+        for a, kw in key_args: p_extract_flat.add_argument(*a, **kw)
+        p_extract_flat.set_defaults(func=handle_cli_extract_flat)
+        
+        p_install = subparsers.add_parser('install-menu', help='Install Windows Context Menu items.')
+        p_install.set_defaults(func=lambda x: install_context_menu())
+
+        args = parser.parse_args()
+        
+        if hasattr(args, 'func'):
+            _keep_window_open_on_error(args.func, args)
+        else:
+            if TkinterDnD: 
+                root = TkinterDnD.Tk()
+            else: 
+                root = tk.Tk()
+            app = ArcToolApp(root)
+            root.mainloop()
