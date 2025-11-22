@@ -1,8 +1,7 @@
 # SaladSoftware - A Kuriimu1/2 MT Framework-only Python Variant
 **Version 2.4.1**
 
-![Screenshot 2025-05-09 123142](https://github.com/user-attachments/assets/88742bf3-1e9f-443b-8be5-d3b23ff674ea)
-![Screenshot 2025-05-09 121140](https://github.com/user-attachments/assets/e23ae47c-b4db-4d64-9464-68096804baf7)
+<img width="1545" height="994" alt="image" src="https://github.com/user-attachments/assets/34b90a34-515c-4a21-8914-fa6829982b44" />
 
 - **Dark Mode UI**
 - **Drag & Drop Support** (Files and Folders)
